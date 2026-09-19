@@ -1,0 +1,365 @@
+import 'package:flutter/material.dart';
+
+import '../models/activity_model.dart';
+import '../models/file_model.dart';
+import '../models/message_model.dart';
+import '../models/project_model.dart';
+import '../models/task_model.dart';
+import '../models/team_member_model.dart';
+import '../models/user_model.dart';
+
+class MockData {
+  static const currentUser = UserModel(
+    id: 'shruti',
+    name: 'Shruti',
+    role: 'Computer Engineering Student',
+    initials: 'S',
+    accent: Color(0xFF3DD9FF),
+  );
+
+  static const teamMembers = [
+    TeamMemberModel(
+      id: 'shruti',
+      name: 'Shruti',
+      initials: 'S',
+      role: 'Product Lead',
+      accent: Color(0xFF53A7FF),
+      status: 'In Progress',
+    ),
+    TeamMemberModel(
+      id: 'rahul',
+      name: 'Rahul',
+      initials: 'RK',
+      role: 'Frontend Dev',
+      accent: Color(0xFF4CC9F0),
+      status: 'In Progress',
+    ),
+    TeamMemberModel(
+      id: 'neha',
+      name: 'Neha',
+      initials: 'NM',
+      role: 'AI Research',
+      accent: Color(0xFFFFB74D),
+      status: 'In Progress',
+    ),
+    TeamMemberModel(
+      id: 'aditya',
+      name: 'Aditya',
+      initials: 'AV',
+      role: 'Documentation',
+      accent: Color(0xFF8CE99A),
+      status: 'Completed',
+    ),
+  ];
+
+  static const projects = [
+    ProjectModel(
+      id: 'project-smart-architecture',
+      name: 'Smart Architecture',
+      description: 'Smart campus infrastructure planning and UI dashboard.',
+      category: 'College',
+      status: 'At Risk',
+      deadlineLabel: '12 Sept',
+      progress: 0.68,
+      completedTasks: 8,
+      totalTasks: 12,
+      teamSize: 4,
+      members: [
+        TeamMemberModel(
+          id: 'shruti',
+          name: 'Shruti',
+          initials: 'S',
+          role: 'Product Lead',
+          accent: Color(0xFF53A7FF),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'rahul',
+          name: 'Rahul',
+          initials: 'RK',
+          role: 'Frontend Dev',
+          accent: Color(0xFF4CC9F0),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'neha',
+          name: 'Neha',
+          initials: 'NM',
+          role: 'AI Research',
+          accent: Color(0xFFFFB74D),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'aditya',
+          name: 'Aditya',
+          initials: 'AV',
+          role: 'Documentation',
+          accent: Color(0xFF8CE99A),
+          status: 'Completed',
+        ),
+      ],
+    ),
+    ProjectModel(
+      id: 'project-expense-tracker',
+      name: 'Expense Tracker',
+      description: 'Budget management app for student expenses and reports.',
+      category: 'Mini Project',
+      status: 'Needs Attention',
+      deadlineLabel: '14 Sept',
+      progress: 0.82,
+      completedTasks: 4,
+      totalTasks: 14,
+      teamSize: 3,
+      members: [
+        TeamMemberModel(
+          id: 'rahul',
+          name: 'Rahul',
+          initials: 'RK',
+          role: 'Frontend Dev',
+          accent: Color(0xFF4CC9F0),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'neha',
+          name: 'Neha',
+          initials: 'NM',
+          role: 'AI Research',
+          accent: Color(0xFFFFB74D),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'shruti',
+          name: 'Shruti',
+          initials: 'S',
+          role: 'Product Lead',
+          accent: Color(0xFF53A7FF),
+          status: 'In Progress',
+        ),
+      ],
+    ),
+    ProjectModel(
+      id: 'project-cybersecurity',
+      name: 'Cybersecurity Project',
+      description: 'Security assessment and threat analysis platform.',
+      category: 'Security',
+      status: 'Needs Attention',
+      deadlineLabel: '16 Sept',
+      progress: 0.45,
+      completedTasks: 9,
+      totalTasks: 16,
+      teamSize: 3,
+      members: [
+        TeamMemberModel(
+          id: 'neha',
+          name: 'Neha',
+          initials: 'NM',
+          role: 'AI Research',
+          accent: Color(0xFFFFB74D),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'rahul',
+          name: 'Rahul',
+          initials: 'RK',
+          role: 'Frontend Dev',
+          accent: Color(0xFF4CC9F0),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'shruti',
+          name: 'Shruti',
+          initials: 'S',
+          role: 'Product Lead',
+          accent: Color(0xFF53A7FF),
+          status: 'In Progress',
+        ),
+      ],
+    ),
+    ProjectModel(
+      id: 'project-dbms',
+      name: 'DBMS Project',
+      description: 'Database project with schema, ERD, and admin dashboard.',
+      category: 'SQL',
+      status: 'On Track',
+      deadlineLabel: '18 Sept',
+      progress: 0.91,
+      completedTasks: 2,
+      totalTasks: 12,
+      teamSize: 2,
+      members: [
+        TeamMemberModel(
+          id: 'shruti',
+          name: 'Shruti',
+          initials: 'S',
+          role: 'Product Lead',
+          accent: Color(0xFF53A7FF),
+          status: 'In Progress',
+        ),
+        TeamMemberModel(
+          id: 'aditya',
+          name: 'Aditya',
+          initials: 'AV',
+          role: 'Documentation',
+          accent: Color(0xFF8CE99A),
+          status: 'Completed',
+        ),
+      ],
+    ),
+  ];
+
+  static const tasks = [
+    TaskModel(
+      id: 'task-1',
+      title: 'Complete DBMS documentation',
+      projectId: 'project-dbms',
+      projectName: 'DBMS Project',
+      assignedMemberId: 'shruti',
+      priority: 'High',
+      status: 'To Do',
+      dueLabel: 'Today, 6:00 PM',
+      estimatedHours: 3,
+      description: 'Write the database design and ERD summary.',
+    ),
+    TaskModel(
+      id: 'task-2',
+      title: 'Push authentication module',
+      projectId: 'project-smart-architecture',
+      projectName: 'Smart Architecture',
+      assignedMemberId: 'rahul',
+      priority: 'High',
+      status: 'In Progress',
+      dueLabel: 'Today, 8:00 PM',
+      estimatedHours: 4,
+      description: 'Finalise the login flow and auth screens.',
+    ),
+    TaskModel(
+      id: 'task-3',
+      title: 'Review UI with team',
+      projectId: 'project-expense-tracker',
+      projectName: 'Expense Tracker',
+      assignedMemberId: 'aditya',
+      priority: 'Medium',
+      status: 'To Do',
+      dueLabel: 'Today, 9:30 PM',
+      estimatedHours: 2,
+      description: 'Collect feedback and note design refinements.',
+    ),
+    TaskModel(
+      id: 'task-4',
+      title: 'Prepare project presentation',
+      projectId: 'project-smart-architecture',
+      projectName: 'Smart Architecture',
+      assignedMemberId: 'shruti',
+      priority: 'Medium',
+      status: 'Completed',
+      dueLabel: 'Today',
+      estimatedHours: 2,
+      description: 'Prepare the presentation deck and talking notes.',
+    ),
+  ];
+
+  static const messages = [
+    MessageModel(
+      id: 'msg-1',
+      senderId: 'rahul',
+      senderName: 'Rahul',
+      text: "I'll finish the login API by Wednesday.",
+      timeLabel: '9:41 AM',
+      isMine: false,
+    ),
+    MessageModel(
+      id: 'msg-2',
+      senderId: 'shruti',
+      senderName: 'You',
+      text: "And I'll prepare the UI for the dashboard.",
+      timeLabel: '9:42 AM',
+      isMine: true,
+    ),
+    MessageModel(
+      id: 'msg-3',
+      senderId: 'aditya',
+      senderName: 'Aditya',
+      text: 'Documentation review after that?',
+      timeLabel: '9:43 AM',
+      isMine: false,
+    ),
+    MessageModel(
+      id: 'msg-4',
+      senderId: 'neha',
+      senderName: 'Neha',
+      text: 'I can help with AI task extraction after the design review.',
+      timeLabel: '9:45 AM',
+      isMine: false,
+    ),
+  ];
+
+  static const projectFiles = [
+    ProjectFileModel(
+      id: 'file-1',
+      name: 'SRS Document v2.pdf',
+      type: 'PDF',
+      uploadedBy: 'Shruti',
+      dateLabel: '6 Sept',
+      size: '2.4 MB',
+      category: 'Requirements',
+    ),
+    ProjectFileModel(
+      id: 'file-2',
+      name: 'Final_Review.pptx',
+      type: 'PPTX',
+      uploadedBy: 'Rahul',
+      dateLabel: '5 Sept',
+      size: '8.1 MB',
+      category: 'Presentations',
+    ),
+    ProjectFileModel(
+      id: 'file-3',
+      name: 'model_train.py',
+      type: 'PY',
+      uploadedBy: 'Neha',
+      dateLabel: '3 Sept',
+      size: '12 KB',
+      category: 'Code',
+    ),
+    ProjectFileModel(
+      id: 'file-4',
+      name: 'field_sensor.jpg',
+      type: 'JPG',
+      uploadedBy: 'Aditya',
+      dateLabel: '3 Sept',
+      size: '1.2 MB',
+      category: 'Design',
+    ),
+  ];
+
+  static const activities = [
+    ActivityModel(
+      id: 'act-1',
+      title: 'Rahul completed Firebase Authentication',
+      timeAgo: '12 minutes ago',
+      projectName: 'Smart Architecture',
+      type: 'Completed',
+    ),
+    ActivityModel(
+      id: 'act-2',
+      title: 'Neha uploaded AI Architecture.pdf',
+      timeAgo: '25 minutes ago',
+      projectName: 'Smart Architecture',
+      type: 'Uploaded',
+    ),
+    ActivityModel(
+      id: 'act-3',
+      title: 'Shruti updated Dashboard UI to In Progress',
+      timeAgo: '40 minutes ago',
+      projectName: 'Smart Architecture',
+      type: 'Updated',
+    ),
+    ActivityModel(
+      id: 'act-4',
+      title: 'Aditya completed Project Documentation',
+      timeAgo: '1 hour ago',
+      projectName: 'Smart Architecture',
+      type: 'Completed',
+    ),
+  ];
+}
