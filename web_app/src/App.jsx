@@ -6,14 +6,20 @@ import {
   addProjectMember,
   checkExistingMembership,
   checkPendingInvitation,
+  createProjectMessage,
   createProject,
   createProjectInvitation,
   createTask,
   declineProjectInvitation,
   findProfileByEmail,
+  getInitials,
   getProfileName,
   getProjectInvitations,
+  listMyProjectFiles,
+  listProjectFiles,
+  loadProjectMessages,
   loadWorkspace,
+  uploadProjectFile,
   updateTask as updateTaskRecord,
 } from './services/supabaseData'
 
@@ -223,23 +229,127 @@ const workspaceFiles = [
   { id: 'f5', name: 'Sprint report.pdf', type: 'PDF', category: 'Reports', size: '640 KB', uploadedBy: 'Shruti Mehta', date: '1 Sep 2026', icon: '▤' },
 ]
 
-const workspaceMessages = [
-  { id: 'cm1', author: 'Rahul Sharma', avatar: 'R', color: 'orange', time: '9:41 AM', text: "I'll finish the login API by Wednesday." },
-  { id: 'cm2', author: 'Shruti Mehta', avatar: 'S', color: 'purple', time: '9:42 AM', text: "And I'll prepare the UI for the dashboard." },
-  { id: 'cm3', author: 'Aryan Kapoor', avatar: 'A', color: 'teal', time: '9:45 AM', text: 'I can help with AI task extraction after the design review.' },
-]
-
-function ProjectWorkspace({ project, tasks, meetings, isAuthenticated, onClose, onCreateTask, onScheduleMeeting, onAddMember, onToggleTask, onUpdateTask, onOpenTask }) {
+function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticated, onClose, onCreateTask, onScheduleMeeting, onAddMember, onToggleTask, onUpdateTask, onOpenTask }) {
   const [activeTab, setActiveTab] = useState('Overview')
   const [fileFilter, setFileFilter] = useState('All')
+  const [messages, setMessages] = useState([])
+  const [messageDraft, setMessageDraft] = useState('')
+  const [onlineMemberIds, setOnlineMemberIds] = useState(new Set())
+  const [chatError, setChatError] = useState('')
+  const [isSendingMessage, setIsSendingMessage] = useState(false)
+  const [projectFiles, setProjectFiles] = useState([])
+  const [isUploadingFile, setIsUploadingFile] = useState(false)
   const projectTasks = tasks.filter((task) => task.projectId === project.id || task.project === project.name)
   const projectMeetings = meetings.filter((meeting) => meeting.project === project.name)
   const completedTasks = projectTasks.filter((task) => task.done).length
   const files = isAuthenticated
-    ? []
+    ? (fileFilter === 'All' ? projectFiles : projectFiles.filter((file) => file.category === fileFilter))
     : (fileFilter === 'All' ? workspaceFiles : workspaceFiles.filter((file) => file.category === fileFilter))
-  const messages = isAuthenticated ? [] : workspaceMessages
   const categories = ['All', 'Documents', 'Presentations', 'Code', 'Images', 'Reports']
+
+  useEffect(() => {
+    if (!isAuthenticated || !project.id) return undefined
+    let isMounted = true
+    listProjectFiles(project.id)
+      .then((nextFiles) => isMounted && setProjectFiles(nextFiles))
+      .catch(() => isMounted && setProjectFiles([]))
+    return () => { isMounted = false }
+  }, [isAuthenticated, project.id])
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !currentUser?.id || isUploadingFile) return
+
+    setIsUploadingFile(true)
+    try {
+      const uploadedFile = await uploadProjectFile(project.id, currentUser.id, file)
+      setProjectFiles((current) => [uploadedFile, ...current])
+      setChatError('')
+    } catch (error) {
+      const message = error?.code === '42501'
+        ? 'You do not have permission to upload files to this project. Run supabase_project_files.sql and confirm you are a project member.'
+        : error?.code === '42P01'
+          ? 'The project_files table is missing. Run supabase_project_files.sql in Supabase.'
+          : error?.message || 'Unable to upload this file.'
+      setChatError(message)
+    } finally {
+      setIsUploadingFile(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!isAuthenticated || !project.id || !currentUser?.id) return undefined
+
+    let isMounted = true
+    const channel = supabase.channel(`project-chat:${project.id}`, {
+      config: { presence: { key: currentUser.id } },
+    })
+
+    const refreshMessages = async () => {
+      try {
+        const nextMessages = await loadProjectMessages(project.id)
+        if (isMounted) {
+          setMessages(nextMessages)
+          setChatError('')
+        }
+      } catch (error) {
+        if (isMounted) setChatError(error.message || 'Chat is unavailable until the chat table is enabled.')
+      }
+    }
+
+    const updatePresence = () => {
+      const state = channel.presenceState()
+      setOnlineMemberIds(new Set(Object.keys(state)))
+    }
+
+    channel
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'project_messages', filter: `project_id=eq.${project.id}` }, refreshMessages)
+      .on('presence', { event: 'sync' }, updatePresence)
+      .on('presence', { event: 'join' }, updatePresence)
+      .on('presence', { event: 'leave' }, updatePresence)
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          await channel.track({ user_id: currentUser.id, name: currentUser.name })
+          updatePresence()
+        }
+      })
+
+    refreshMessages()
+    return () => {
+      isMounted = false
+      supabase.removeChannel(channel)
+      setOnlineMemberIds(new Set())
+    }
+  }, [currentUser, isAuthenticated, project.id])
+
+  const sendMessage = async (event) => {
+    event.preventDefault()
+    const body = messageDraft.trim()
+    if (!body || !currentUser?.id || isSendingMessage) return
+
+    setIsSendingMessage(true)
+    try {
+      const savedMessage = await createProjectMessage(project.id, currentUser.id, body)
+      setMessages((current) => [...current, {
+        id: savedMessage.id,
+        senderId: currentUser.id,
+        author: currentUser.name,
+        avatar: currentUser.avatar,
+        color: currentUser.color,
+        time: new Date(savedMessage.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+        text: savedMessage.body,
+      }])
+      setMessageDraft('')
+      setChatError('')
+    } catch (error) {
+      setChatError(error.message || 'Unable to send message.')
+    } finally {
+      setIsSendingMessage(false)
+    }
+  }
+
+  const isMemberOnline = (member) => member.id === currentUser?.id || onlineMemberIds.has(member.id)
 
   const updateTask = (taskId, field, value) => onUpdateTask(taskId, { [field]: value, ...(field === 'status' ? { done: value === 'Completed' } : {}) })
 
@@ -267,13 +377,13 @@ function ProjectWorkspace({ project, tasks, meetings, isAuthenticated, onClose, 
         <div className="workspace-header"><div className="workspace-title-row"><button className="back-projects" onClick={onClose}>← Back to Projects</button><span className="section-kicker">{project.type} PROJECT</span><h2>{project.name}</h2><p>{project.description}</p></div><div className="workspace-header-meta"><span className="status-badge">{project.progress < 50 ? 'At Risk' : 'On Track'}</span><strong>{project.progress}%</strong><small>Target · {project.due}</small></div></div>
         <div className="workspace-tabs" role="tablist">{['Overview', 'Tasks', 'Chat', 'Files', 'Meetings'].map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>{tab}</button>)}</div>
 
-        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>Active workspace</span></div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div><button className="add-member-btn" onClick={onAddMember}>+ Add Member</button></div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}>{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
+        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>{project.members.filter(isMemberOnline).length} online now</span></div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div><button className="add-member-btn" onClick={onAddMember}>+ Add Member</button></div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}><i className={isMemberOnline(member) ? 'presence-dot online' : 'presence-dot'} />{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{isMemberOnline(member) ? 'Active now' : 'Offline'} · {member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
 
         {activeTab === 'Tasks' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">DELIVERY BOARD</span><h3>All project tasks <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="task-table-head"><span>Task</span><span>Priority</span><span>Assignee</span><span>Due</span><span>Status</span></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div>}
 
-        {activeTab === 'Chat' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CONVERSATION</span><h3>Team chat</h3></div><span className="live-label">● Live</span></div>{messages.length ? <div className="chat-feed">{messages.map((message) => <div className="chat-message" key={message.id}><div className={`avatar avatar-${message.color}`}>{message.avatar}</div><div><div className="chat-meta"><strong>{message.author}</strong><span>{message.time}</span></div><p>{message.text}</p></div></div>)}</div> : <p className="empty-state">No messages yet.</p>} {!isAuthenticated && <><div className="ai-detection"><div><span className="ai-mini">✦</span><strong>AI detected 2 tasks in this conversation</strong><p>Review suggested tasks before adding them to the project.</p></div><div><button className="ghost-button" onClick={() => window.alert('Task review is ready for the Groupify AI connection.')}>Review</button><button className="primary-button compact-button" onClick={onCreateTask}>Accept All</button></div></div><div className="chat-composer"><input placeholder="Message your project team..." aria-label="Message your project team" /><button aria-label="Send message">↑</button></div></>}</div>}
+        {activeTab === 'Chat' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CONVERSATION</span><h3>Team chat</h3></div><span className="live-label">● {project.members.filter(isMemberOnline).length} online</span></div><div className="chat-members">{project.members.filter(isMemberOnline).map((member) => <div className="chat-member" key={member.id}><div className={`avatar avatar-${member.color || 'purple'}`}><i className="presence-dot online" />{member.avatar || member.name.charAt(0)}</div><span>{member.name.split(' ')[0]}<small>Active</small></span></div>)}</div>{chatError && <p className="chat-error">{chatError}</p>}{messages.length ? <div className="chat-feed">{messages.map((message) => <div className={message.senderId === currentUser?.id ? 'chat-message mine' : 'chat-message'} key={message.id}><div className={`avatar avatar-${message.color || 'blue'}`}>{message.avatar}</div><div><div className="chat-meta"><strong>{message.senderId === currentUser?.id ? 'You' : message.author}</strong><span>{message.time}</span></div><p>{message.text}</p></div></div>)}</div> : <p className="empty-state">No messages yet. Start the conversation.</p>}<form className="chat-composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Message your project team..." aria-label="Message your project team" disabled={isSendingMessage} /><button type="submit" aria-label="Send message" disabled={!messageDraft.trim() || isSendingMessage}>↑</button></form></div>}
 
-        {activeTab === 'Files' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT FILES</span><h3>Shared resources</h3></div><button className="primary-button compact-button" onClick={() => window.alert('File upload will connect to Supabase Storage.')}>↥ Upload file</button></div><div className="file-filters">{categories.map((category) => <button className={fileFilter === category ? 'selected' : ''} key={category} onClick={() => setFileFilter(category)}>{category}</button>)}</div>{files.length ? <div className="file-grid">{files.map((file) => <article className="file-card" key={file.id}><div className="file-icon">{file.icon}</div><button className="file-more" aria-label={`More options for ${file.name}`}>•••</button><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>Uploaded by {file.uploadedBy}<br />{file.date}</small></article>)}</div> : <p className="empty-state">No files yet.</p>}</div>}
+        {activeTab === 'Files' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT FILES</span><h3>Shared resources</h3></div><><input id={`project-file-${project.id}`} className="project-file-input" type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip" onChange={handleFileUpload} disabled={isUploadingFile} /><label className="primary-button compact-button project-file-button" htmlFor={`project-file-${project.id}`}>{isUploadingFile ? 'Uploading...' : '↥ Upload file'}</label></></div><div className="file-filters">{categories.map((category) => <button className={fileFilter === category ? 'selected' : ''} key={category} onClick={() => setFileFilter(category)}>{category}</button>)}</div>{files.length ? <div className="file-grid">{files.map((file) => <article className="file-card" key={file.id}><div className="file-icon">{file.icon}</div><a className="file-more" aria-label={`Open ${file.name}`} href={file.url} target="_blank" rel="noreferrer">↗</a><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>Uploaded by {file.uploadedBy}<br />{file.date}</small></article>)}</div> : <p className="empty-state">No files yet. Upload a document or image to share it with the project.</p>}</div>}
 
         {activeTab === 'Meetings' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CALENDAR</span><h3>Meetings</h3></div><button className="primary-button compact-button" onClick={onScheduleMeeting}>+ Schedule Meeting</button></div>{projectMeetings.length ? <div className="meeting-group"><span className="meeting-label">UPCOMING MEETINGS</span>{projectMeetings.map((meeting) => <div className="meeting-card" key={meeting.id}><div className="meeting-icon">◷</div><div><strong>{meeting.title}</strong><span>{meeting.time}</span><small>{meeting.host || 'Project team'} · {meeting.status}</small></div><span className="status-badge">Upcoming</span></div>)}</div> : <p className="empty-state">No meetings yet.</p>}{!isAuthenticated && <div className="meeting-group"><span className="meeting-label">PAST MEETINGS</span><div className="meeting-card past"><div className="meeting-icon">✓</div><div><strong>Weekly project review</strong><span>2 Sep 2026 · 3:00 PM</span><small>4 participants · Past</small></div><button className="ghost-button" onClick={() => window.alert('AI summary generated from the meeting transcript.')}>Generate AI Summary</button></div><div className="meeting-summary"><strong>AI meeting summary</strong><p><b>Key Decisions:</b> Finalize the dashboard flow and auth API integration.</p><p><b>Tasks Assigned:</b> Rahul owns the login API; Shruti owns dashboard UI.</p><p><b>Deadlines:</b> First review by Wednesday.</p><p><b>Open Questions:</b> Confirm production deployment environment.</p></div></div>}</div>}
         <button className="workspace-close" onClick={onClose}>Close Workspace</button>
@@ -294,6 +404,11 @@ function App() {
   const [invitations, setInvitations] = useState([])
   const [projectInvitations, setProjectInvitations] = useState([])
   const [filter, setFilter] = useState('All')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [githubRepo, setGithubRepo] = useState('')
+  const [githubConnected, setGithubConnected] = useState(false)
+  const [emailNotifications, setEmailNotifications] = useState(true)
+  const [myUploadedFiles, setMyUploadedFiles] = useState([])
   
   // Modals & Selection
   const [selectedProject, setSelectedProject] = useState(null)
@@ -489,6 +604,18 @@ function App() {
   }, [selectedProject])
 
   useEffect(() => {
+    if (!supabaseUser || !projectsList.length) {
+      setMyUploadedFiles([])
+      return
+    }
+    let isMounted = true
+    listMyProjectFiles(projectsList.map((project) => project.id), supabaseUser.id)
+      .then((files) => isMounted && setMyUploadedFiles(files))
+      .catch(() => isMounted && setMyUploadedFiles([]))
+    return () => { isMounted = false }
+  }, [projectsList, supabaseUser])
+
+  useEffect(() => {
     const handleInvitationFromUrl = async () => {
       const urlParams = new URLSearchParams(window.location.search)
       const invitationId = urlParams.get('invitation')
@@ -584,6 +711,17 @@ function App() {
     }
   }
 
+  const openNewTaskComposer = () => {
+    if (!projectsList.length) {
+      showSupabaseError(null, 'Create or join a project before adding a task.')
+      return
+    }
+    setIsWorkspaceTaskModal(false)
+    setNewTaskProject(projectsList[0].name)
+    setNewTaskAssignee(getProfileName(supabaseUser, profile))
+    setShowNewTaskModal(true)
+  }
+
   // Create Task
   const handleCreateTask = async (e) => {
     e.preventDefault()
@@ -613,6 +751,7 @@ function App() {
 
     try {
       const assigneeProfile = targetProject.members.find((member) => member.name === newTaskAssignee)
+        || (newTaskAssignee === getProfileName(supabaseUser, profile) ? profile : null)
       const newTaskObj = await createTask(supabaseUser, {
         projectId: targetProject.id,
         project: targetProject,
@@ -829,18 +968,53 @@ function App() {
     ? projectsList 
     : projectsList.filter((project) => filter === 'Active' ? project.progress < 100 : filter === 'At Risk' ? project.progress < 50 : project.progress === 100)
 
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase()
+  const searchProjects = normalizedSearchQuery
+    ? projectsList.filter((project) => project.name.toLowerCase().includes(normalizedSearchQuery)).slice(0, 5)
+    : []
+  const searchTasks = normalizedSearchQuery
+    ? tasks.filter((task) => task.title.toLowerCase().includes(normalizedSearchQuery) || task.project.toLowerCase().includes(normalizedSearchQuery)).slice(0, 5)
+    : []
+
   // Priority Rank Helper: High (1), Medium (2), Low (3)
   const priorityOrder = { 'High': 1, 'Medium': 2, 'Low': 3 }
 
   // ONLY LOGGED IN USER'S TASKS (Shruti Mehta / You), sorted by High priority first
   const myUserTasks = tasks
-    .filter(task => task.assignee === 'Shruti Mehta' || task.assignee === 'You' || task.assignee.includes('Shruti'))
+    .filter(task => task.assigneeId === supabaseUser?.id || task.assignee === getProfileName(supabaseUser, profile) || task.assignee === 'You' || task.assignee?.includes('Shruti'))
     .sort((a, b) => (priorityOrder[a.priority] || 4) - (priorityOrder[b.priority] || 4))
 
   // Tasks inside a specific project workspace
   const projectTasks = selectedProject 
     ? tasks.filter(t => t.projectId === selectedProject.id || t.project === selectedProject.name) 
     : []
+
+  const activityItems = [
+    ...tasks.filter((task) => task.assignee && task.assignee !== 'Unassigned').slice(0, 8).map((task) => ({
+      id: `task-${task.id}`,
+      avatar: task.assigneeAvatar || getInitials(task.assignee),
+      color: task.assignee?.toLowerCase().includes('rahul') ? 'orange' : task.assignee?.toLowerCase().includes('priya') ? 'pink' : task.assignee?.toLowerCase().includes('aryan') ? 'teal' : 'purple',
+      text: `${task.done ? 'completed' : 'is working on'} task`,
+      subject: task.title,
+      context: `${task.project} · ${task.assignee}`,
+    })),
+    ...meetingsList.filter((meeting) => meeting.host).slice(0, 4).map((meeting) => ({
+      id: `meeting-${meeting.id}`,
+      avatar: meeting.hostAvatar || getInitials(meeting.host),
+      color: 'blue',
+      text: 'scheduled a team meeting',
+      subject: meeting.title,
+      context: `${meeting.project} · ${meeting.time}`,
+    })),
+    ...projectsList.filter((project) => project.members.length).slice(0, 4).map((project) => ({
+      id: `project-${project.id}`,
+      avatar: project.members.find((member) => member.id === supabaseUser?.id)?.avatar || project.members[0].avatar,
+      color: 'purple',
+      text: 'is available in your workspace',
+      subject: project.name,
+      context: `${project.members.length} team member${project.members.length === 1 ? '' : 's'}`,
+    })),
+  ].slice(0, 12)
 
   if (!supabaseUser) {
     return (
@@ -911,18 +1085,12 @@ function App() {
           ))}
         </nav>
         <div className="nav-label">WORKSPACE</div>
-        <button className="nav-item"><span>▣</span>Files</button>
-        <button 
-          className={activeNav === 'Meetings' ? 'nav-item active' : 'nav-item'}
-          onClick={() => setActiveNav('Meetings')}
-        >
-          <span>◫</span>Meetings <em>{meetingsList.length}</em>
-        </button>
-        <button className="nav-item"><span>⌘</span>GitHub</button>
+        <button className={activeNav === 'Files' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Files')}><span>▣</span>Files</button>
+        <button className={activeNav === 'GitHub' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('GitHub')}><span>⌘</span>GitHub</button>
         <div className="sidebar-bottom">
-          <button className="nav-item"><span>⚙</span>Settings</button>
+          <button className={activeNav === 'Settings' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Settings')}><span>⚙</span>Settings</button>
           <div className="profile-mini">
-            <div className="avatar avatar-purple">S</div>
+            <div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div>
             <span><strong>{profile?.name || getProfileName(supabaseUser)}</strong><small>{supabaseUser?.email || 'View profile'}</small></span>
             <span>⋯</span>
           </div>
@@ -937,9 +1105,20 @@ function App() {
           </div>
           <div className="top-actions">
             <button className="ghost-button" onClick={handleLogout}>Log out</button>
-            <button className="search-trigger">⌕ <span>Search anything...</span><kbd>⌘ K</kbd></button>
-            <button className="icon-button notification">♢<i></i></button>
-            <div className="avatar avatar-purple">S</div>
+            <div className="search-trigger search-box">
+              <span className="search-icon">⌕</span>
+              <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search anything..." aria-label="Search projects and tasks" />
+              <kbd>⌘ K</kbd>
+              {normalizedSearchQuery && <div className="search-results">
+                {searchProjects.map((project) => <button key={`project-${project.id}`} onClick={() => { setSelectedProject(project); setSearchQuery('') }}><strong>{project.name}</strong><small>Project</small></button>)}
+                {searchTasks.map((task) => <button key={`task-${task.id}`} onClick={() => { setSelectedTask(task); setSearchQuery('') }}><strong>{task.title}</strong><small>{task.project}</small></button>)}
+                {!searchProjects.length && !searchTasks.length && <span className="search-empty">No matching projects or tasks</span>}
+              </div>}
+            </div>
+            <div className="topbar-profile" title={supabaseUser?.email || 'Logged-in account'}>
+              <div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div>
+              <span><strong>{profile?.name || getProfileName(supabaseUser, profile)}</strong><small>{supabaseUser?.email}</small></span>
+            </div>
           </div>
         </header>
 
@@ -1018,21 +1197,15 @@ function App() {
                   <h2 style={{ fontSize: '26px', margin: '4px 0 2px' }}>Your tasks ({myUserTasks.length})</h2>
                   <p style={{ fontSize: '12px', color: '#687d98', margin: '0' }}>Filtered to your account (Shruti Mehta) · Sorted by High Priority first</p>
                 </div>
-                <button 
-                  className="primary-button" 
-                  onClick={() => {
-                    setIsWorkspaceTaskModal(false)
-                    setNewTaskProject(projectsList[0]?.name || '')
-                    setShowNewTaskModal(true)
-                  }}
-                >
-                  + Add task
-                </button>
+                <button className="primary-button" onClick={openNewTaskComposer}>+ Add task</button>
               </div>
 
               <div className="task-list">
                 {myUserTasks.length === 0 ? (
-                  <p style={{ color: '#687c97', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>No tasks assigned to you currently.</p>
+                  <div style={{ textAlign: 'center', padding: '20px 0' }}>
+                    <p style={{ color: '#687c97', fontSize: '12px', margin: '0 0 12px' }}>No tasks assigned to you currently.</p>
+                    <button className="primary-button compact-button" onClick={openNewTaskComposer}>Create your first task</button>
+                  </div>
                 ) : (
                   myUserTasks.map((task) => (
                     <div className={task.done ? 'task-row done' : 'task-row'} key={task.id} onClick={() => setSelectedTask(task)}>
@@ -1054,6 +1227,30 @@ function App() {
                   ))
                 )}
               </div>
+            </section>
+          ) : activeNav === 'Files' ? (
+            <section className="panel workspace-page-panel">
+              <div className="panel-heading">
+                <div><div className="section-kicker">WORKSPACE FILES</div><h2>Shared files</h2><p>Open a project to upload and manage files for its team.</p></div>
+              </div>
+              <div className="file-grid workspace-file-grid">
+                {myUploadedFiles.map((file) => <article className="file-card" key={file.id}>
+                  <div className="file-icon">{file.icon}</div><a className="file-more" href={file.url} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`}>↗</a><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>{file.projectName}<br />{file.date}</small>
+                </article>)}
+              </div>
+              {!myUploadedFiles.length && <p className="empty-state">You have not uploaded any files yet.</p>}
+              <div className="workspace-project-links"><h3>Project file spaces</h3>{projectsList.length ? projectsList.map((project) => <button className="workspace-link-row" key={project.id} onClick={() => setSelectedProject(project)}><span><strong>{project.name}</strong><small>{project.members.length} members · Open Files tab to upload</small></span><b>Open →</b></button>) : <p className="empty-state">No projects available yet.</p>}</div>
+            </section>
+          ) : activeNav === 'GitHub' ? (
+            <section className="panel workspace-page-panel">
+              <div className="panel-heading"><div><div className="section-kicker">DEVELOPER WORKSPACE</div><h2>GitHub</h2><p>Connect a repository so your team can reach the project code quickly.</p></div><span className="status-badge">{githubConnected ? 'Connected' : 'Not connected'}</span></div>
+              <div className="github-connect-card"><label htmlFor="github-repository">Repository URL</label><div className="github-input-row"><input id="github-repository" value={githubRepo} onChange={(event) => setGithubRepo(event.target.value)} placeholder="https://github.com/your-team/repository" /><button className="primary-button" onClick={() => { if (githubRepo.trim()) setGithubConnected(true) }}>Save repository</button></div>{githubConnected && <a className="github-repository-link" href={githubRepo} target="_blank" rel="noreferrer">Open connected repository ↗</a>}</div>
+              <div className="github-feature-grid"><div><strong>Project code</strong><span>Keep the repository link visible to every workspace member.</span></div><div><strong>Team workflow</strong><span>Use Tasks and Activity alongside your GitHub work.</span></div></div>
+            </section>
+          ) : activeNav === 'Settings' ? (
+            <section className="panel workspace-page-panel">
+              <div className="panel-heading"><div><div className="section-kicker">WORKSPACE PREFERENCES</div><h2>Settings</h2><p>Manage your Groupify account preferences.</p></div></div>
+              <div className="settings-list"><div className="settings-row"><span><strong>Account</strong><small>{profile?.name || getProfileName(supabaseUser, profile)} · {supabaseUser?.email}</small></span><div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div></div><label className="settings-row settings-toggle"><span><strong>Email notifications</strong><small>Receive updates about invitations and workspace activity.</small></span><input type="checkbox" checked={emailNotifications} onChange={(event) => setEmailNotifications(event.target.checked)} /></label><div className="settings-row"><span><strong>Session</strong><small>Sign out of this Groupify account.</small></span><button className="ghost-button" onClick={handleLogout}>Log out</button></div></div>
             </section>
           ) : activeNav === 'Meetings' ? (
             /* DEDICATED MEETINGS PAGE - VISIBLE TO EVERYONE! */
@@ -1156,7 +1353,12 @@ function App() {
                   <p style={{ fontSize: '12px', color: '#687d98', margin: '0' }}>Real-time updates across all workspace projects</p>
                 </div>
               </div>
-              {supabaseUser ? <p className="empty-state">No activity yet.</p> : <div className="activity-list" style={{ marginTop: '15px' }}>
+              {supabaseUser ? <div className="activity-list" style={{ marginTop: '15px' }}>{activityItems.length ? activityItems.map((item) => (
+                <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }} key={item.id}>
+                  <div className={`avatar avatar-${item.color}`}>{item.avatar}</div>
+                  <div><p><strong>{item.text}</strong> <b>{item.subject}</b></p><span>{item.context}</span></div>
+                </div>
+              )) : <p className="empty-state">No activity yet. Create a task, meeting, or project to see updates here.</p>}</div> : <div className="activity-list" style={{ marginTop: '15px' }}>
                 <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
                   <div className="avatar avatar-orange">R</div>
                   <div><p><strong>Rahul Sharma</strong> pushed 3 commits to <b>authentication-fix</b></p><span>12 minutes ago · Smart Agriculture</span></div>
@@ -1696,6 +1898,7 @@ function App() {
           project={selectedProject}
           tasks={tasks}
           meetings={meetingsList}
+          currentUser={{ id: supabaseUser.id, name: profile?.name || getProfileName(supabaseUser), avatar: profile?.initials || 'U', color: 'purple' }}
           onClose={() => setSelectedProject(null)}
           onCreateTask={() => {
             setIsWorkspaceTaskModal(true)
