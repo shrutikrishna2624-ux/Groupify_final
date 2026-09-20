@@ -4,7 +4,7 @@ const memberColors = ['purple', 'orange', 'pink', 'teal', 'blue']
 const projectTones = ['blue', 'violet', 'green']
 
 export function getProfileName(user, profile) {
-  return profile?.name || user?.user_metadata?.name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
+  return profile?.display_name || profile?.name || user?.user_metadata?.name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
 }
 
 export function getInitials(name) {
@@ -23,7 +23,7 @@ export function formatDate(date) {
 }
 
 function mapMember(profile, membership, index) {
-  const name = profile?.name || profile?.email || 'Team member'
+  const name = profile?.display_name || profile?.name || profile?.email || 'Team member'
   return {
     id: profile?.id || membership.user_id,
     name,
@@ -35,6 +35,8 @@ function mapMember(profile, membership, index) {
 
 export function mapProjectFromSupabase(project, members = []) {
   const tone = projectTones[Math.abs(String(project.id).charCodeAt(0)) % projectTones.length]
+  // Check localStorage for githubUrl as fallback if database column doesn't exist
+  const localGithubUrl = localStorage.getItem(`github_${project.id}`)
   return {
     id: project.id,
     name: project.name,
@@ -46,6 +48,28 @@ export function mapProjectFromSupabase(project, members = []) {
     status: project.status || 'Active',
     tone,
     members,
+    githubUrl: project.github_url || localGithubUrl || null,
+  }
+}
+
+export async function updateProjectGithubUrl(projectId, githubUrl) {
+  try {
+    const { data, error } = await supabase.from('projects').update({ github_url: githubUrl }).eq('id', projectId).select().maybeSingle()
+    if (error) throw error
+    if (!data) {
+      console.log('Project not found in database, using localStorage fallback')
+      // Store in localStorage as fallback
+      localStorage.setItem(`github_${projectId}`, githubUrl)
+      return { id: projectId, github_url: githubUrl }
+    }
+    return data
+  } catch (error) {
+    // If column doesn't exist or other errors, use localStorage as fallback
+    console.log('Database update failed, using localStorage fallback:', error.message)
+    // Store in localStorage as fallback
+    localStorage.setItem(`github_${projectId}`, githubUrl)
+    // Return a mock object with the githubUrl
+    return { id: projectId, github_url: githubUrl }
   }
 }
 
@@ -79,7 +103,23 @@ export async function ensureProfile(user, nameOverride) {
     role: 'Student',
     initials: getInitials(name),
   }
-  const { data, error } = await supabase.from('profiles').upsert(profile).select().single()
+  
+  // Try with new fields first, fall back to basic fields if columns don't exist
+  const profileWithNewFields = {
+    ...profile,
+    display_name: name,
+  }
+  
+  let { data, error } = await supabase.from('profiles').upsert(profileWithNewFields).select().single()
+  
+  // If error is about missing columns, try without the new fields
+  if (error && error.message && error.message.includes('column')) {
+    console.log('New onboarding columns not yet created, using basic profile')
+    const result = await supabase.from('profiles').upsert(profile).select().single()
+    data = result.data
+    error = result.error
+  }
+  
   if (error) throw error
   return data
 }
@@ -210,7 +250,11 @@ function mapProjectFile(file, projectId, signedUrl, uploaderId) {
 async function mapStoredProjectFile(file, projectId, uploaderId) {
   const { data: signedFile, error: signedUrlError } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 3600)
   if (signedUrlError) throw signedUrlError
-  return { ...mapProjectFile({ name: file.name, created_at: file.created_at, metadata: { mimetype: file.content_type, size: file.size } }, projectId, signedFile.signedUrl, uploaderId), uploaderId: file.uploaded_by || uploaderId }
+  return { 
+    ...mapProjectFile({ name: file.name, created_at: file.created_at, metadata: { mimetype: file.content_type, size: file.size } }, projectId, signedFile.signedUrl, uploaderId), 
+    uploaderId: file.uploaded_by || uploaderId,
+    date: file.created_at ? new Date(file.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : ''
+  }
 }
 
 export async function listProjectFiles(projectId, uploaderId) {
@@ -225,7 +269,47 @@ export async function listMyProjectFiles(projectIds, uploaderId) {
   if (!projectIds.length || !uploaderId) return []
   const { data: files, error } = await supabase.from('project_files').select('*, projects(name)').in('project_id', projectIds).eq('uploaded_by', uploaderId).order('created_at', { ascending: false })
   if (error) throw error
-  return Promise.all((files || []).map(async (file) => ({ ...(await mapStoredProjectFile(file, file.project_id, uploaderId)), projectName: file.projects?.name || 'Project' })))
+  return Promise.all((files || []).map(async (file) => {
+    const mappedFile = await mapStoredProjectFile(file, file.project_id, uploaderId)
+    return {
+      ...mappedFile,
+      projectName: file.projects?.name || 'Project'
+    }
+  }))
+}
+
+export async function listAllProjectFiles(projectIds) {
+  if (!projectIds.length) return []
+  
+  try {
+    const { data: files, error } = await supabase.from('project_files').select('*, projects(name)').in('project_id', projectIds).order('created_at', { ascending: false })
+    if (error) throw error
+    
+    // Get all uploader IDs to fetch their profiles
+    const uploaderIds = [...new Set((files || []).map(file => file.uploaded_by).filter(Boolean))]
+    const { data: profiles, error: profilesError } = uploaderIds.length 
+      ? await supabase.from('profiles').select('id, name, initials').in('id', uploaderIds)
+      : { data: [], error: null }
+    
+    if (profilesError) console.log('Could not fetch uploader profiles:', profilesError.message)
+    
+    const profileMap = new Map((profiles || []).map(p => [p.id, p]))
+    
+    return Promise.all((files || []).map(async (file) => {
+      const mappedFile = await mapStoredProjectFile(file, file.project_id, file.uploaded_by)
+      const uploaderProfile = profileMap.get(file.uploaded_by)
+      
+      return {
+        ...mappedFile,
+        projectName: file.projects?.name || 'Project',
+        uploaderName: uploaderProfile?.name || 'Team member',
+        uploaderInitials: uploaderProfile?.initials || 'T'
+      }
+    }))
+  } catch (error) {
+    console.log('Error loading all project files:', error.message)
+    return []
+  }
 }
 
 export async function uploadProjectFile(projectId, uploaderId, file) {
@@ -417,4 +501,58 @@ export async function checkPendingInvitation(projectId, email) {
     .maybeSingle()
   if (error) throw error
   return data
+}
+
+export async function checkOnboardingCompleted(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('onboarding_completed')
+      .eq('id', userId)
+      .maybeSingle()
+    if (error) throw error
+    return data?.onboarding_completed || false
+  } catch (error) {
+    // If column doesn't exist yet, assume onboarding is not needed
+    if (error.message && error.message.includes('column')) {
+      console.log('onboarding_completed column not yet created, skipping onboarding check')
+      return true // Skip onboarding until migration is run
+    }
+    throw error
+  }
+}
+
+export async function saveOnboardingData(userId, onboardingData) {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({
+        display_name: onboardingData.displayName,
+        role: onboardingData.role,
+        year: onboardingData.year,
+        focus_area: onboardingData.focusArea,
+        onboarding_completed: true,
+      })
+      .eq('id', userId)
+      .select()
+      .single()
+    if (error) throw error
+    return data
+  } catch (error) {
+    // If columns don't exist yet, try updating just the name field
+    if (error.message && error.message.includes('column')) {
+      console.log('Some onboarding columns not yet created, updating basic profile')
+      const { data, error: updateError } = await supabase
+        .from('profiles')
+        .update({
+          name: onboardingData.displayName,
+        })
+        .eq('id', userId)
+        .select()
+        .single()
+      if (updateError) throw updateError
+      return data
+    }
+    throw error
+  }
 }

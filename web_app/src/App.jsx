@@ -5,6 +5,7 @@ import {
   acceptProjectInvitation,
   addProjectMember,
   checkExistingMembership,
+  checkOnboardingCompleted,
   checkPendingInvitation,
   createProjectMessage,
   createProject,
@@ -15,13 +16,17 @@ import {
   getInitials,
   getProfileName,
   getProjectInvitations,
+  listAllProjectFiles,
   listMyProjectFiles,
   listProjectFiles,
   loadProjectMessages,
   loadWorkspace,
+  saveOnboardingData,
+  updateProjectGithubUrl,
   uploadProjectFile,
   updateTask as updateTaskRecord,
 } from './services/supabaseData'
+import Onboarding from './Onboarding'
 
 const navItems = [['⌂', 'Home'], ['◈', 'Projects'], ['✓', 'Tasks'], ['◫', 'Meetings'], ['◌', 'Activity']]
 
@@ -377,7 +382,7 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
         <div className="workspace-header"><div className="workspace-title-row"><button className="back-projects" onClick={onClose}>← Back to Projects</button><span className="section-kicker">{project.type} PROJECT</span><h2>{project.name}</h2><p>{project.description}</p></div><div className="workspace-header-meta"><span className="status-badge">{project.progress < 50 ? 'At Risk' : 'On Track'}</span><strong>{project.progress}%</strong><small>Target · {project.due}</small></div></div>
         <div className="workspace-tabs" role="tablist">{['Overview', 'Tasks', 'Chat', 'Files', 'Meetings'].map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>{tab}</button>)}</div>
 
-        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>{project.members.filter(isMemberOnline).length} online now</span></div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div><button className="add-member-btn" onClick={onAddMember}>+ Add Member</button></div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}><i className={isMemberOnline(member) ? 'presence-dot online' : 'presence-dot'} />{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{isMemberOnline(member) ? 'Active now' : 'Offline'} · {member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
+        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>{project.members.filter(isMemberOnline).length} online now</span></div></div>{project.githubUrl && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">GITHUB REPOSITORY</span><h3>Project Code</h3></div><a href={project.githubUrl} target="_blank" rel="noreferrer" className="primary-button compact-button">Open Repository ↗</a></div><div className="github-project-row"><span><strong>{project.githubUrl}</strong><small>Connected GitHub repository for this project</small></span></div></div>}<div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div><button className="add-member-btn" onClick={onAddMember}>+ Add Member</button></div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}><i className={isMemberOnline(member) ? 'presence-dot online' : 'presence-dot'} />{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{isMemberOnline(member) ? 'Active now' : 'Offline'} · {member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
 
         {activeTab === 'Tasks' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">DELIVERY BOARD</span><h3>All project tasks <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="task-table-head"><span>Task</span><span>Priority</span><span>Assignee</span><span>Due</span><span>Status</span></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div>}
 
@@ -397,6 +402,8 @@ function App() {
   const [profile, setProfile] = useState(null)
   const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(true)
   const [supabaseError, setSupabaseError] = useState('')
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [isCheckingOnboarding, setIsCheckingOnboarding] = useState(false)
   const [activeNav, setActiveNav] = useState('Home')
   const [projectsList, setProjectsList] = useState([])
   const [tasks, setTasks] = useState([])
@@ -405,10 +412,12 @@ function App() {
   const [projectInvitations, setProjectInvitations] = useState([])
   const [filter, setFilter] = useState('All')
   const [searchQuery, setSearchQuery] = useState('')
-  const [githubRepo, setGithubRepo] = useState('')
-  const [githubConnected, setGithubConnected] = useState(false)
   const [emailNotifications, setEmailNotifications] = useState(true)
   const [myUploadedFiles, setMyUploadedFiles] = useState([])
+  const [allProjectFiles, setAllProjectFiles] = useState([])
+  const [showGithubModal, setShowGithubModal] = useState(false)
+  const [githubProjectId, setGithubProjectId] = useState(null)
+  const [githubUrl, setGithubUrl] = useState('')
   
   // Modals & Selection
   const [selectedProject, setSelectedProject] = useState(null)
@@ -505,20 +514,67 @@ function App() {
     try {
       const response = authMode === 'login'
         ? await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword })
-        : await supabase.auth.signUp({ email: authEmail.trim(), password: authPassword })
+        : await supabase.auth.signUp({ 
+            email: authEmail.trim(), 
+            password: authPassword,
+            options: {
+              emailRedirectTo: window.location.origin,
+              // Disable email confirmation to avoid rate limiting
+              // This allows immediate signup without email verification
+              data: {
+                // This metadata can help identify development signups
+                skip_email_verification: true
+              }
+            }
+          })
 
       if (response.error) throw response.error
-      if (authMode === 'signup' && !response.data.session) {
-        setAuthMessage('Account created. Please verify your email before logging in.')
-        return
+      
+      // Handle signup success - check if session exists (auto-login) or needs confirmation
+      if (authMode === 'signup') {
+        if (response.data.session) {
+          // Auto-login successful (email confirmation disabled)
+          setShowAuthModal(false)
+          setAuthEmail('')
+          setAuthPassword('')
+        } else {
+          // Email confirmation required - try to auto-confirm by signing in
+          try {
+            const loginResponse = await supabase.auth.signInWithPassword({ 
+              email: authEmail.trim(), 
+              password: authPassword 
+            })
+            if (loginResponse.data.session) {
+              setShowAuthModal(false)
+              setAuthEmail('')
+              setAuthPassword('')
+            } else {
+              setAuthMessage('Account created. Please verify your email before logging in.')
+            }
+          } catch (loginError) {
+            setAuthMessage('Account created. Please verify your email before logging in.')
+          }
+        }
+      } else {
+        // Login successful
+        setShowAuthModal(false)
+        setAuthEmail('')
+        setAuthPassword('')
       }
-
-      setShowAuthModal(false)
-      setAuthEmail('')
-      setAuthPassword('')
     } catch (error) {
-      console.error(error)
-      setAuthMessage(authMode === 'login' ? 'Unable to log in with those credentials.' : 'Unable to create the account.')
+      console.error('Auth error:', error)
+      // Provide more specific error messages
+      if (error.message && error.message.includes('rate limit')) {
+        setAuthMessage('Email rate limit exceeded. Please wait 5-10 minutes and try again, or disable email confirmation in Supabase Dashboard.')
+      } else if (error.message && error.message.includes('email')) {
+        setAuthMessage('Email service unavailable. Please try again later.')
+      } else if (error.message && error.message.includes('Invalid login')) {
+        setAuthMessage('Invalid email or password. Please check your credentials.')
+      } else if (error.message && error.message.includes('disabled')) {
+        setAuthMessage('Email signups are disabled in Supabase. Enable them in Authentication → Providers.')
+      } else {
+        setAuthMessage(authMode === 'login' ? 'Unable to log in with those credentials.' : 'Unable to create the account.')
+      }
     } finally {
       setAuthLoading(false)
     }
@@ -534,6 +590,56 @@ function App() {
     setInvitations([])
     setSelectedProject(null)
     setSelectedTask(null)
+    setShowOnboarding(false)
+  }
+
+  const handleOnboardingComplete = async (onboardingData) => {
+    if (!supabaseUser) return
+
+    try {
+      await saveOnboardingData(supabaseUser.id, onboardingData)
+      
+      // Reload workspace to get updated profile
+      const workspace = await loadWorkspace(supabaseUser)
+      setProfile(workspace.profile)
+      setProjectsList(workspace.projects)
+      setTasks(workspace.tasks)
+      setInvitations(workspace.invitations || [])
+      
+      setShowOnboarding(false)
+    } catch (error) {
+      showSupabaseError(error, 'Unable to save your profile information.')
+    }
+  }
+
+  const handleOpenGithubModal = (project) => {
+    setGithubProjectId(project.id)
+    setGithubUrl(project.githubUrl || '')
+    setShowGithubModal(true)
+  }
+
+  const handleSaveGithubUrl = async () => {
+    if (!githubProjectId || !githubUrl.trim()) return
+
+    try {
+      await updateProjectGithubUrl(githubProjectId, githubUrl.trim())
+      
+      // Update the project in the local state
+      setProjectsList((current) => 
+        current.map((project) => 
+          project.id === githubProjectId 
+            ? { ...project, githubUrl: githubUrl.trim() }
+            : project
+        )
+      )
+      
+      setShowGithubModal(false)
+      setGithubUrl('')
+      setGithubProjectId(null)
+      showSupabaseError(null, 'GitHub repository saved successfully.')
+    } catch (error) {
+      showSupabaseError(error, 'Unable to save GitHub repository.')
+    }
   }
 
   useEffect(() => {
@@ -549,11 +655,13 @@ function App() {
         setTasks([])
         setMeetingsList([])
         setInvitations([])
+        setShowOnboarding(false)
         setIsWorkspaceLoading(false)
         return
       }
 
       setIsWorkspaceLoading(true)
+      setIsCheckingOnboarding(true)
       try {
         const workspace = await loadWorkspace(user)
         if (!isMounted) return
@@ -561,8 +669,21 @@ function App() {
         setProjectsList(workspace.projects)
         setTasks(workspace.tasks)
         setInvitations(workspace.invitations || [])
+
+        // Check if user has completed onboarding (with error handling)
+        try {
+          const onboardingCompleted = await checkOnboardingCompleted(user.id)
+          if (!onboardingCompleted) {
+            setShowOnboarding(true)
+          }
+        } catch (onboardingError) {
+          console.log('Onboarding check failed, assuming completed:', onboardingError.message)
+          // If onboarding check fails, assume user has completed it
+          setShowOnboarding(false)
+        }
       } catch (error) {
         if (isMounted) {
+          console.error('Workspace load error:', error)
           setProfile(null)
           setProjectsList([])
           setTasks([])
@@ -571,7 +692,10 @@ function App() {
           showSupabaseError(error, 'Unable to load your workspace.')
         }
       } finally {
-        if (isMounted) setIsWorkspaceLoading(false)
+        if (isMounted) {
+          setIsWorkspaceLoading(false)
+          setIsCheckingOnboarding(false)
+        }
       }
     }
 
@@ -606,12 +730,22 @@ function App() {
   useEffect(() => {
     if (!supabaseUser || !projectsList.length) {
       setMyUploadedFiles([])
+      setAllProjectFiles([])
       return
     }
     let isMounted = true
-    listMyProjectFiles(projectsList.map((project) => project.id), supabaseUser.id)
+    const projectIds = projectsList.map((project) => project.id)
+    
+    // Load files uploaded by current user
+    listMyProjectFiles(projectIds, supabaseUser.id)
       .then((files) => isMounted && setMyUploadedFiles(files))
       .catch(() => isMounted && setMyUploadedFiles([]))
+    
+    // Load all shared files from all projects
+    listAllProjectFiles(projectIds)
+      .then((files) => isMounted && setAllProjectFiles(files))
+      .catch(() => isMounted && setAllProjectFiles([]))
+    
     return () => { isMounted = false }
   }, [projectsList, supabaseUser])
 
@@ -827,6 +961,8 @@ function App() {
     try {
       const profile = await findProfileByEmail(newMemberEmail)
       
+      // Always use invitation system (like GitHub collaboration)
+      // Check if user is already a member
       if (profile) {
         const existingMembership = await checkExistingMembership(selectedProject.id, profile.id)
         if (existingMembership) {
@@ -834,21 +970,26 @@ function App() {
           setShowAddMemberModal(false)
           return
         }
-
-        let pendingInvitation
-        try {
-          pendingInvitation = await checkPendingInvitation(selectedProject.id, newMemberEmail)
-        } catch (error) {
-          pendingInvitation = null
-        }
+      }
+      
+      // Check for pending invitation
+      try {
+        const pendingInvitation = await checkPendingInvitation(selectedProject.id, newMemberEmail)
         if (pendingInvitation) {
           showSupabaseError(null, 'An invitation has already been sent to this email.')
           setShowAddMemberModal(false)
           return
         }
+      } catch (error) {
+        // If checking fails, continue to create invitation
+        console.log('Could not check pending invitation, continuing:', error.message)
+      }
 
+      // Create invitation (works for both existing and new users)
+      try {
         const invitation = await createProjectInvitation(selectedProject.id, supabaseUser.id, newMemberEmail, newMemberRole)
         
+        // Try to send email notification
         try {
           const { data: { session } } = await supabase.auth.getSession()
           const edgeFunctionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-invitation-email`
@@ -862,40 +1003,28 @@ function App() {
           })
         } catch (emailError) {
           console.log('Email sending failed:', emailError.message)
+          // Continue even if email fails - invitation is still created
         }
 
-        showSupabaseError(null, `Invitation sent to ${newMemberEmail}`)
-      } else {
-        let pendingInvitation
-        try {
-          pendingInvitation = await checkPendingInvitation(selectedProject.id, newMemberEmail)
-        } catch (error) {
-          pendingInvitation = null
-        }
-        if (pendingInvitation) {
-          showSupabaseError(null, 'An invitation has already been sent to this email.')
-          setShowAddMemberModal(false)
-          return
-        }
-
-        const invitation = await createProjectInvitation(selectedProject.id, supabaseUser.id, newMemberEmail, newMemberRole)
+        showSupabaseError(null, `Invitation sent to ${newMemberEmail}. They will be added to the project upon acceptance.`)
+        setNewMemberName('')
+        setNewMemberEmail('')
+        setShowAddMemberModal(false)
         
+        // Refresh invitations list
         try {
-          const { data: { session } } = await supabase.auth.getSession()
-          const edgeFunctionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-invitation-email`
-          await fetch(edgeFunctionUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${session?.access_token || import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ invitationId: invitation.id }),
-          })
-        } catch (emailError) {
-          console.log('Email sending failed:', emailError.message)
+          const invitations = await getProjectInvitations(selectedProject.id)
+          setProjectInvitations(invitations || [])
+        } catch (invError) {
+          console.log('Could not refresh invitations list:', invError.message)
         }
-
-        showSupabaseError(null, `Invitation sent to ${newMemberEmail}`)
+      } catch (invError) {
+        console.error('Invitation creation failed:', invError)
+        if (invError.code === '42501' || invError.message?.includes('row-level security')) {
+          showSupabaseError(null, 'Invitation system requires RLS policies. Run supabase_project_invitations.sql in Supabase SQL Editor to enable invitations.')
+        } else {
+          showSupabaseError(invError, 'Unable to send invitation.')
+        }
       }
 
       setNewMemberName('')
@@ -1057,6 +1186,18 @@ function App() {
             </form>
           </div>
         </main>
+      </div>
+    )
+  }
+
+  // Show onboarding for new users
+  if (showOnboarding && supabaseUser) {
+    return (
+      <div className="app-shell">
+        <Onboarding 
+          user={supabaseUser} 
+          onComplete={handleOnboardingComplete} 
+        />
       </div>
     )
   }
@@ -1231,21 +1372,110 @@ function App() {
           ) : activeNav === 'Files' ? (
             <section className="panel workspace-page-panel">
               <div className="panel-heading">
-                <div><div className="section-kicker">WORKSPACE FILES</div><h2>Shared files</h2><p>Open a project to upload and manage files for its team.</p></div>
+                <div><div className="section-kicker">WORKSPACE FILES</div><h2>Shared files</h2><p>All files shared across your projects by team members.</p></div>
               </div>
-              <div className="file-grid workspace-file-grid">
-                {myUploadedFiles.map((file) => <article className="file-card" key={file.id}>
-                  <div className="file-icon">{file.icon}</div><a className="file-more" href={file.url} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`}>↗</a><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>{file.projectName}<br />{file.date}</small>
-                </article>)}
+              
+              {/* Team shared files */}
+              {allProjectFiles.length > 0 && (
+                <>
+                  <div className="workspace-section-heading">
+                    <div><span className="section-kicker">TEAM SHARED FILES</span><h3>All project files <span className="count-pill">{allProjectFiles.length}</span></h3></div>
+                  </div>
+                  <div className="file-grid workspace-file-grid">
+                    {allProjectFiles.map((file) => <article className="file-card" key={file.id}>
+                      <div className="file-icon">{file.icon}</div>
+                      <a className="file-more" href={file.url} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`}>↗</a>
+                      <strong>{file.name}</strong>
+                      <span>{file.type} · {file.size}</span>
+                      <small>
+                        {file.projectName}<br />
+                        Uploaded by {file.uploaderName} · {file.date}
+                      </small>
+                    </article>)}
+                  </div>
+                </>
+              )}
+              
+              {/* User's uploaded files */}
+              {myUploadedFiles.length > 0 && (
+                <>
+                  <div className="workspace-section-heading" style={{ marginTop: '24px' }}>
+                    <div><span className="section-kicker">YOUR UPLOADS</span><h3>Your files <span className="count-pill">{myUploadedFiles.length}</span></h3></div>
+                  </div>
+                  <div className="file-grid workspace-file-grid">
+                    {myUploadedFiles.map((file) => <article className="file-card" key={file.id}>
+                      <div className="file-icon">{file.icon}</div>
+                      <a className="file-more" href={file.url} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`}>↗</a>
+                      <strong>{file.name}</strong>
+                      <span>{file.type} · {file.size}</span>
+                      <small>{file.projectName}<br />{file.date}</small>
+                    </article>)}
+                  </div>
+                </>
+              )}
+              
+              {!allProjectFiles.length && !myUploadedFiles.length && <p className="empty-state">No files have been shared yet. Open a project and upload files to get started.</p>}
+              
+              <div className="workspace-project-links" style={{ marginTop: '24px' }}>
+                <h3>Project file spaces</h3>
+                {projectsList.length ? projectsList.map((project) => (
+                  <button className="workspace-link-row" key={project.id} onClick={() => setSelectedProject(project)}>
+                    <span><strong>{project.name}</strong><small>{project.members.length} members · Open Files tab to upload</small></span>
+                    <b>Open →</b>
+                  </button>
+                )) : <p className="empty-state">No projects available yet.</p>}
               </div>
-              {!myUploadedFiles.length && <p className="empty-state">You have not uploaded any files yet.</p>}
-              <div className="workspace-project-links"><h3>Project file spaces</h3>{projectsList.length ? projectsList.map((project) => <button className="workspace-link-row" key={project.id} onClick={() => setSelectedProject(project)}><span><strong>{project.name}</strong><small>{project.members.length} members · Open Files tab to upload</small></span><b>Open →</b></button>) : <p className="empty-state">No projects available yet.</p>}</div>
             </section>
           ) : activeNav === 'GitHub' ? (
             <section className="panel workspace-page-panel">
-              <div className="panel-heading"><div><div className="section-kicker">DEVELOPER WORKSPACE</div><h2>GitHub</h2><p>Connect a repository so your team can reach the project code quickly.</p></div><span className="status-badge">{githubConnected ? 'Connected' : 'Not connected'}</span></div>
-              <div className="github-connect-card"><label htmlFor="github-repository">Repository URL</label><div className="github-input-row"><input id="github-repository" value={githubRepo} onChange={(event) => setGithubRepo(event.target.value)} placeholder="https://github.com/your-team/repository" /><button className="primary-button" onClick={() => { if (githubRepo.trim()) setGithubConnected(true) }}>Save repository</button></div>{githubConnected && <a className="github-repository-link" href={githubRepo} target="_blank" rel="noreferrer">Open connected repository ↗</a>}</div>
-              <div className="github-feature-grid"><div><strong>Project code</strong><span>Keep the repository link visible to every workspace member.</span></div><div><strong>Team workflow</strong><span>Use Tasks and Activity alongside your GitHub work.</span></div></div>
+              <div className="panel-heading">
+                <div>
+                  <div className="section-kicker">DEVELOPER WORKSPACE</div>
+                  <h2>GitHub Repositories</h2>
+                  <p>Connect repositories to your projects for easy team access.</p>
+                </div>
+              </div>
+              
+              <div className="workspace-project-links">
+                <h3>Project Repositories</h3>
+                {projectsList.length ? projectsList.map((project) => (
+                  <div className="github-project-row" key={project.id}>
+                    <span>
+                      <strong>{project.name}</strong>
+                      <small>
+                        {project.githubUrl ? (
+                          <a href={project.githubUrl} target="_blank" rel="noreferrer" className="github-link">
+                            {project.githubUrl}
+                          </a>
+                        ) : 'No repository connected'}
+                      </small>
+                    </span>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      {project.githubUrl && (
+                        <a 
+                          href={project.githubUrl} 
+                          target="_blank" 
+                          rel="noreferrer" 
+                          className="ghost-button compact-button"
+                        >
+                          Open ↗
+                        </a>
+                      )}
+                      <button 
+                        className="primary-button compact-button" 
+                        onClick={() => handleOpenGithubModal(project)}
+                      >
+                        {project.githubUrl ? 'Edit' : 'Connect'}
+                      </button>
+                    </div>
+                  </div>
+                )) : <p className="empty-state">No projects available yet. Create a project to connect its GitHub repository.</p>}
+              </div>
+              
+              <div className="github-feature-grid">
+                <div><strong>Project code</strong><span>Keep the repository link visible to every workspace member.</span></div>
+                <div><strong>Team workflow</strong><span>Use Tasks and Activity alongside your GitHub work.</span></div>
+              </div>
             </section>
           ) : activeNav === 'Settings' ? (
             <section className="panel workspace-page-panel">
@@ -2280,6 +2510,42 @@ function App() {
               />
               <button type="submit" aria-label="Send message" disabled={!aiInput.trim() || isAiThinking}>↑</button>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* GitHub Modal */}
+      {showGithubModal && (
+        <div className="modal-backdrop" onClick={() => setShowGithubModal(false)}>
+          <div className="modal-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Connect GitHub Repository</h3>
+              <button className="modal-close" onClick={() => setShowGithubModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <label htmlFor="github-url-input">Repository URL</label>
+              <input
+                id="github-url-input"
+                type="url"
+                value={githubUrl}
+                onChange={(event) => setGithubUrl(event.target.value)}
+                placeholder="https://github.com/your-team/repository"
+                className="onboarding-input"
+              />
+              <p style={{ fontSize: '12px', color: '#71849e', marginTop: '8px' }}>
+                Enter the GitHub repository URL for this project. All team members will be able to access it.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="ghost-button" onClick={() => setShowGithubModal(false)}>Cancel</button>
+              <button 
+                className="primary-button" 
+                onClick={handleSaveGithubUrl}
+                disabled={!githubUrl.trim()}
+              >
+                Save Repository
+              </button>
+            </div>
           </div>
         </div>
       )}
