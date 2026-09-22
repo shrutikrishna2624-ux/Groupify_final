@@ -183,6 +183,9 @@ export async function loadWorkspace(user) {
 }
 
 export async function createProject(user, values) {
+  console.log('=== CREATING PROJECT ===')
+  console.log('User:', user.id, 'Project name:', values.name)
+  
   await ensureProfile(user)
 
   const { data: project, error } = await supabase.from('projects').insert({
@@ -195,14 +198,24 @@ export async function createProject(user, values) {
   }).select().single()
   if (error) throw error
 
+  console.log('Project created successfully:', project.id)
+
   const { error: memberError } = await supabase.from('project_members').upsert({ project_id: project.id, user_id: user.id, role: 'Product Lead' })
   if (memberError) throw memberError
+
+  console.log('Project member added, now logging activity...')
+
+  // Log activity
+  await logActivity(user.id, project.id, 'project_created', project.name, `${project.members?.length || 1} team member`, project.id)
 
   const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle()
   return mapProjectFromSupabase(project, [mapMember(profile, { user_id: user.id, role: 'Product Lead' }, 0)])
 }
 
 export async function createTask(user, values) {
+  console.log('=== CREATING TASK ===')
+  console.log('User:', user.id, 'Task title:', values.title, 'Project ID:', values.projectId)
+  
   const { data: task, error } = await supabase.from('tasks').insert({
     project_id: values.projectId,
     title: values.title,
@@ -214,12 +227,41 @@ export async function createTask(user, values) {
     deadline: values.deadline,
   }).select().single()
   if (error) throw error
+
+  console.log('Task created successfully:', task.id)
+
+  // Log activity
+  await logActivity(user.id, values.projectId, 'task_created', task.title, values.project?.name || 'Project', task.id)
+
   return mapTaskFromSupabase(task, values.project, values.assigneeProfile)
 }
 
 export async function updateTask(taskId, changes) {
+  console.log('=== UPDATING TASK ===')
+  console.log('Task ID:', taskId, 'Changes:', changes)
+  
   const { data, error } = await supabase.from('tasks').update(changes).eq('id', taskId).select().single()
   if (error) throw error
+
+  console.log('Task updated successfully:', data.id, 'Status:', data.status, 'Done:', data.done)
+
+  // Log activity if task status changed to completed
+  if (changes.status === 'Completed' || changes.done === true) {
+    console.log('Task marked as completed, logging activity...')
+    try {
+      await logActivity(
+        data.assigned_to || data.created_by, 
+        data.project_id, 
+        'task_completed', 
+        data.title, 
+        'Task marked as completed',
+        taskId // Use task ID to prevent duplicate completions
+      )
+    } catch (logError) {
+      console.log('Failed to log task completion:', logError.message)
+    }
+  }
+
   return data
 }
 
@@ -313,6 +355,9 @@ export async function listAllProjectFiles(projectIds) {
 }
 
 export async function uploadProjectFile(projectId, uploaderId, file) {
+  console.log('=== UPLOADING FILE ===')
+  console.log('Project ID:', projectId, 'Uploader:', uploaderId, 'File:', file.name)
+  
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
   const path = `${projectId}/${crypto.randomUUID()}-${safeName}`
   const { error: uploadError } = await supabase.storage.from('project-files').upload(path, file, { upsert: false })
@@ -327,6 +372,12 @@ export async function uploadProjectFile(projectId, uploaderId, file) {
     uploaded_by: uploaderId,
   }).select().single()
   if (error) throw error
+
+  console.log('File uploaded successfully:', data.id)
+
+  // Log activity
+  await logActivity(uploaderId, projectId, 'file_uploaded', file.name, 'File uploaded to project', data.id)
+
   return mapStoredProjectFile(data, projectId, uploaderId)
 }
 
@@ -399,6 +450,16 @@ export async function createProjectMessage(projectId, senderId, body) {
 export async function addProjectMember(projectId, userId, role) {
   const { error } = await supabase.from('project_members').insert({ project_id: projectId, user_id: userId, role })
   if (error) throw error
+
+  // Get the user profile to log activity
+  try {
+    const { data: profile } = await supabase.from('profiles').select('name').eq('id', userId).maybeSingle()
+    if (profile) {
+      await logActivity(userId, projectId, 'member_added', profile.name, `Added as ${role}`, userId)
+    }
+  } catch (logError) {
+    console.log('Failed to log member addition:', logError.message)
+  }
 }
 
 export async function findProfileByEmail(email) {
@@ -553,6 +614,238 @@ export async function saveOnboardingData(userId, onboardingData) {
       if (updateError) throw updateError
       return data
     }
+    throw error
+  }
+}
+
+// Activity logging functions
+export async function logActivity(userId, projectId, actionType, subject, context, subjectId = null) {
+  try {
+    console.log('=== LOGGING ACTIVITY ===')
+    console.log('Details:', { userId, projectId, actionType, subject, context, subjectId })
+    
+    // Try to insert with subject_id first
+    let insertData = {
+      user_id: userId,
+      project_id: projectId,
+      action_type: actionType,
+      subject: subject,
+      context: context,
+    }
+    
+    // Only add subject_id if it's provided
+    if (subjectId) {
+      insertData.subject_id = subjectId
+    }
+    
+    const { error } = await supabase.from('activity_log').insert(insertData)
+    
+    if (error) {
+      console.error('Activity logging ERROR:', error)
+      console.error('Error code:', error.code)
+      console.error('Error message:', error.message)
+      console.error('Error details:', error.details)
+      
+      // If it's a column doesn't exist error, try without subject_id
+      if (error.message && error.message.includes('column') && error.message.includes('subject_id')) {
+        console.log('subject_id column doesn\'t exist, trying without it...')
+        const { error: retryError } = await supabase.from('activity_log').insert({
+          user_id: userId,
+          project_id: projectId,
+          action_type: actionType,
+          subject: subject,
+          context: context,
+        })
+        
+        if (retryError) {
+          console.error('Retry also failed:', retryError)
+          throw retryError
+        }
+        
+        console.log('✅ Activity logged successfully (without subject_id)')
+        return
+      }
+      
+      // If it's a duplicate key error, just log it and don't throw
+      if (error.code === '23505') {
+        console.log('Activity already logged (duplicate), skipping')
+        return
+      }
+      throw error
+    }
+    
+    console.log('✅ Activity logged successfully')
+  } catch (error) {
+    console.error('❌ Failed to log activity:', error.message)
+    console.error('Full error:', error)
+    // Don't throw - activity logging shouldn't break the main flow
+  }
+}
+
+export async function loadActivities(projectIds) {
+  try {
+    console.log('=== LOADING ACTIVITIES ===')
+    console.log('Project IDs:', projectIds)
+    
+    if (!projectIds || projectIds.length === 0) {
+      console.log('❌ No project IDs provided, returning empty activities')
+      return []
+    }
+    
+    console.log('Querying activity_log table...')
+    
+    // First, check if the table exists by trying a simple query
+    const { data: tableCheck, error: tableError } = await supabase
+      .from('activity_log')
+      .select('id')
+      .limit(1)
+    
+    if (tableError) {
+      console.error('❌ activity_log table might not exist:', tableError)
+      console.error('Error code:', tableError.code)
+      console.error('Error message:', tableError.message)
+      console.error('⚠️ PLEASE RUN THE SQL SCRIPT: supabase_activity_log.sql')
+      return []
+    }
+    
+    console.log('✅ activity_log table exists, proceeding with full query...')
+    
+    const { data: activities, error } = await supabase
+      .from('activity_log')
+      .select('*, profiles(name, initials), projects(name)')
+      .in('project_id', projectIds)
+      .order('created_at', { ascending: false })
+      .limit(50)
+    
+    if (error) {
+      console.error('❌ Error loading activities:', error)
+      console.error('Error code:', error.code)
+      console.error('Error message:', error.message)
+      // Don't throw, just return empty array
+      return []
+    }
+    
+    console.log('✅ Raw activities loaded:', activities?.length || 0, 'items')
+    if (activities?.length > 0) {
+      console.log('Sample activity:', activities[0])
+    }
+    
+    // Remove duplicates based on user_id, action_type, and subject_id
+    const uniqueActivities = []
+    const seen = new Set()
+    
+    for (const activity of (activities || [])) {
+      const key = `${activity.user_id}-${activity.action_type}-${activity.subject_id || activity.subject}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        uniqueActivities.push(activity)
+      }
+    }
+    
+    console.log('✅ After deduplication:', uniqueActivities.length, 'unique activities')
+    
+    const mappedActivities = uniqueActivities.map((activity) => ({
+      id: activity.id,
+      avatar: activity.profiles?.initials || 'U',
+      color: 'blue',
+      text: getActivityText(activity.action_type),
+      subject: activity.subject,
+      context: `${activity.projects?.name || 'Workspace'} · ${formatTimeAgo(activity.created_at)}`,
+      createdAt: activity.created_at,
+    }))
+    
+    console.log('✅ Final mapped activities:', mappedActivities.length, 'items')
+    if (mappedActivities.length > 0) {
+      console.log('Sample mapped activity:', mappedActivities[0])
+    }
+    
+    return mappedActivities
+  } catch (error) {
+    console.error('❌ Failed to load activities:', error.message)
+    console.error('Full error:', error)
+    return []
+  }
+}
+
+function getActivityText(actionType) {
+  const actionTexts = {
+    'task_completed': 'completed task',
+    'task_created': 'created task',
+    'task_updated': 'updated task',
+    'project_created': 'created project',
+    'project_updated': 'updated project',
+    'file_uploaded': 'uploaded file',
+    'meeting_scheduled': 'scheduled meeting',
+    'member_added': 'added team member',
+    'status_changed': 'changed status',
+  }
+  return actionTexts[actionType] || 'performed action'
+}
+
+function formatTimeAgo(dateString) {
+  if (!dateString) return 'just now'
+  const date = new Date(dateString)
+  const now = new Date()
+  const diffMs = now - date
+  const diffMins = Math.floor(diffMs / 60000)
+  const diffHours = Math.floor(diffMs / 3600000)
+  const diffDays = Math.floor(diffMs / 86400000)
+  
+  if (diffMins < 1) return 'just now'
+  if (diffMins < 60) return `${diffMins} minute${diffMins === 1 ? '' : 's'} ago`
+  if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`
+  if (diffDays < 7) return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`
+  return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+}
+
+// Simple test function to manually insert an activity (for debugging)
+export async function insertTestActivity(userId, projectId, actionType, subject) {
+  try {
+    console.log('=== MANUAL TEST ACTIVITY INSERT ===')
+    console.log('Inserting:', { userId, projectId, actionType, subject })
+    
+    // Try with subject_id first
+    let insertData = {
+      user_id: userId,
+      project_id: projectId,
+      action_type: actionType,
+      subject: subject,
+      context: 'Manual test activity',
+    }
+    
+    const { data, error } = await supabase.from('activity_log').insert(insertData).select().single()
+    
+    if (error) {
+      console.error('❌ Manual insert failed:', error)
+      console.error('Error code:', error.code)
+      console.error('Error message:', error.message)
+      
+      // If it's a column error, try without any optional fields
+      if (error.message && error.message.includes('column')) {
+        console.log('Column error, trying with minimal fields...')
+        const { data: retryData, error: retryError } = await supabase.from('activity_log').insert({
+          user_id: userId,
+          project_id: projectId,
+          action_type: actionType,
+          subject: subject,
+        }).select().single()
+        
+        if (retryError) {
+          console.error('Retry also failed:', retryError)
+          throw retryError
+        }
+        
+        console.log('✅ Manual insert successful (minimal):', retryData)
+        return retryData
+      }
+      
+      throw error
+    }
+    
+    console.log('✅ Manual insert successful:', data)
+    return data
+  } catch (error) {
+    console.error('❌ Manual test activity failed:', error)
     throw error
   }
 }

@@ -16,11 +16,14 @@ import {
   getInitials,
   getProfileName,
   getProjectInvitations,
+  insertTestActivity,
   listAllProjectFiles,
   listMyProjectFiles,
   listProjectFiles,
+  loadActivities,
   loadProjectMessages,
   loadWorkspace,
+  logActivity,
   saveOnboardingData,
   updateProjectGithubUrl,
   uploadProjectFile,
@@ -29,13 +32,6 @@ import {
 import Onboarding from './Onboarding'
 
 const navItems = [['⌂', 'Home'], ['◈', 'Projects'], ['✓', 'Tasks'], ['◫', 'Meetings'], ['◌', 'Activity']]
-
-const defaultMembers = [
-  { id: 'm1', name: 'Shruti Mehta', role: 'Product Lead', avatar: 'S', color: 'purple' },
-  { id: 'm2', name: 'Rahul Sharma', role: 'Frontend Dev', avatar: 'R', color: 'orange' },
-  { id: 'm3', name: 'Priya Verma', role: 'UI/UX Lead', avatar: 'P', color: 'pink' },
-  { id: 'm4', name: 'Aryan Kapoor', role: 'AI Researcher', avatar: 'A', color: 'teal' },
-]
 
 const _initialProjects = [
   { 
@@ -356,11 +352,15 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
 
   const isMemberOnline = (member) => member.id === currentUser?.id || onlineMemberIds.has(member.id)
 
-  const updateTask = (taskId, field, value) => onUpdateTask(taskId, { [field]: value, ...(field === 'status' ? { done: value === 'Completed' } : {}) })
+  const updateTask = (taskId, field, value) => {
+    const task = projectTasks.find((item) => item.id === taskId)
+    if (field === 'status' && (value === 'Completed' || task?.done) && task?.assigneeId !== currentUser?.id) return
+    onUpdateTask(taskId, { [field]: value, ...(field === 'status' ? { done: value === 'Completed' } : {}) })
+  }
 
   const taskRow = (task) => (
     <div className={task.done ? 'workspace-task done' : 'workspace-task'} key={task.id}>
-      <button className="task-check" onClick={() => onToggleTask(task.id)}>{task.done ? '✓' : ''}</button>
+      <button className="task-check" disabled={task.assigneeId !== currentUser?.id} onClick={() => onToggleTask(task.id)}>{task.done ? '✓' : ''}</button>
       <button className="workspace-task-title" onClick={() => onOpenTask(task)}>{task.title}<small>{task.estimatedHours ? `${task.estimatedHours}h estimated` : 'Effort not set'}</small></button>
       <select value={task.priority} onChange={(event) => updateTask(task.id, 'priority', event.target.value)} aria-label={`Priority for ${task.title}`}><option>High</option><option>Medium</option><option>Low</option></select>
       <select value={task.assignee} onChange={(event) => {
@@ -410,6 +410,7 @@ function App() {
   const [meetingsList, setMeetingsList] = useState([])
   const [invitations, setInvitations] = useState([])
   const [projectInvitations, setProjectInvitations] = useState([])
+  const [activities, setActivities] = useState([])
   const [filter, setFilter] = useState('All')
   const [searchQuery, setSearchQuery] = useState('')
   const [emailNotifications, setEmailNotifications] = useState(true)
@@ -464,7 +465,7 @@ function App() {
   // Form State - Task (Date + Time)
   const [newTaskTitle, setNewTaskTitle] = useState('')
   const [newTaskProject, setNewTaskProject] = useState('')
-  const [newTaskAssignee, setNewTaskAssignee] = useState('Shruti Mehta')
+  const [newTaskAssignee, setNewTaskAssignee] = useState('')
   const [newTaskPriority, setNewTaskPriority] = useState('High')
   const [newTaskDayOption, setNewTaskDayOption] = useState('Today')
   const [newTaskCustomDate, setNewTaskCustomDate] = useState('2026-09-15')
@@ -591,6 +592,36 @@ function App() {
     setSelectedProject(null)
     setSelectedTask(null)
     setShowOnboarding(false)
+  }
+
+  const handleManualTestActivity = async () => {
+    if (!supabaseUser || !projectsList.length) {
+      console.log('Cannot create test activity: no user or projects')
+      alert('Please log in and have at least one project')
+      return
+    }
+    
+    try {
+      const testProjectId = projectsList[0].id
+      console.log('Creating manual test activity for project:', testProjectId)
+      
+      await insertTestActivity(
+        supabaseUser.id, 
+        testProjectId, 
+        'task_created', 
+        'Manual Test Activity'
+      )
+      
+      // Reload activities
+      const projectIds = projectsList.map((project) => project.id)
+      const updatedActivities = await loadActivities(projectIds)
+      setActivities(updatedActivities)
+      
+      alert('Test activity created! Check the Activity section.')
+    } catch (error) {
+      console.error('Error creating manual test activity:', error)
+      alert('Error: ' + error.message + '\n\nMake sure you have run the SQL script in Supabase!')
+    }
   }
 
   const handleOnboardingComplete = async (onboardingData) => {
@@ -731,6 +762,7 @@ function App() {
     if (!supabaseUser || !projectsList.length) {
       setMyUploadedFiles([])
       setAllProjectFiles([])
+      setActivities([])
       return
     }
     let isMounted = true
@@ -746,7 +778,40 @@ function App() {
       .then((files) => isMounted && setAllProjectFiles(files))
       .catch(() => isMounted && setAllProjectFiles([]))
     
-    return () => { isMounted = false }
+    // Load activities
+    loadActivities(projectIds)
+      .then((activityData) => {
+        console.log('🎯 Activities loaded in App.jsx:', activityData.length, 'items')
+        console.log('🎯 Activity data:', activityData)
+        if (isMounted) setActivities(activityData)
+      })
+      .catch((error) => {
+        console.error('❌ Error loading activities in App.jsx:', error)
+        if (isMounted) setActivities([])
+      })
+    
+    // Set up real-time subscription for activities
+    const channel = supabase
+      .channel('activity-changes')
+      .on('postgres_changes', 
+        { event: 'INSERT', schema: 'public', table: 'activity_log' },
+        async (payload) => {
+          console.log('Real-time activity update received:', payload)
+          if (!isMounted) return
+          // Reload activities when new activity is logged
+          const updatedActivities = await loadActivities(projectIds)
+          console.log('Updated activities after real-time event:', updatedActivities.length, 'items')
+          if (isMounted) setActivities(updatedActivities)
+        }
+      )
+      .subscribe((status) => {
+        console.log('Real-time subscription status:', status)
+      })
+    
+    return () => { 
+      isMounted = false
+      supabase.removeChannel(channel)
+    }
   }, [projectsList, supabaseUser])
 
   useEffect(() => {
@@ -788,7 +853,7 @@ function App() {
   // Task Toggle
   const toggleTask = async (taskId) => {
     const task = tasks.find((item) => item.id === taskId)
-    if (!task) return
+    if (!task || task.assigneeId !== supabaseUser?.id) return
     const nextStatus = task.done ? 'Todo' : 'Completed'
     try {
       if (supabaseUser && !String(taskId).startsWith('t')) await updateTaskRecord(taskId, { status: nextStatus })
@@ -801,6 +866,7 @@ function App() {
   const updateTask = async (taskId, changes) => {
     const task = tasks.find((item) => item.id === taskId)
     if (!task) return
+    if (changes.status && (changes.status === 'Completed' || task.done) && task.assigneeId !== supabaseUser?.id) return
     const databaseChanges = {}
     if (changes.priority) databaseChanges.priority = changes.priority
     if (changes.assigneeId !== undefined) databaseChanges.assigned_to = changes.assigneeId
@@ -852,7 +918,7 @@ function App() {
     }
     setIsWorkspaceTaskModal(false)
     setNewTaskProject(projectsList[0].name)
-    setNewTaskAssignee(getProfileName(supabaseUser, profile))
+    setNewTaskAssignee(projectsList[0].members[0]?.name || '')
     setShowNewTaskModal(true)
   }
 
@@ -1117,8 +1183,12 @@ function App() {
   const projectTasks = selectedProject 
     ? tasks.filter(t => t.projectId === selectedProject.id || t.project === selectedProject.name) 
     : []
+  const taskProject = isWorkspaceTaskModal && selectedProject
+    ? selectedProject
+    : projectsList.find((project) => project.name === newTaskProject)
+  const taskMembers = taskProject?.members || []
 
-  const activityItems = [
+  const activityItems = activities.length > 0 ? activities : [
     ...tasks.filter((task) => task.assignee && task.assignee !== 'Unassigned').slice(0, 8).map((task) => ({
       id: `task-${task.id}`,
       avatar: task.assigneeAvatar || getInitials(task.assignee),
@@ -1144,6 +1214,11 @@ function App() {
       context: `${project.members.length} team member${project.members.length === 1 ? '' : 's'}`,
     })),
   ].slice(0, 12)
+
+  console.log('🎯 Current activities state:', activities.length, 'items')
+  console.log('🎯 Using database activities?', activities.length > 0)
+  console.log('🎯 Using fallback activities?', activities.length === 0)
+  console.log('🎯 Final activityItems:', activityItems.length, 'items')
 
   if (!supabaseUser) {
     return (
@@ -1350,7 +1425,7 @@ function App() {
                 ) : (
                   myUserTasks.map((task) => (
                     <div className={task.done ? 'task-row done' : 'task-row'} key={task.id} onClick={() => setSelectedTask(task)}>
-                      <button className="task-check" onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>{task.done ? '✓' : ''}</button>
+                      <button className="task-check" disabled={task.assigneeId !== supabaseUser?.id} onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>{task.done ? '✓' : ''}</button>
                       <div className="task-detail">
                         <strong>{task.title}</strong>
                         <span>
@@ -1578,34 +1653,57 @@ function App() {
             <section className="panel" style={{ background: '#0a1424', marginBottom: '40px' }}>
               <div className="panel-heading">
                 <div>
-                  <div className="section-kicker">TEAM PULSE & AUDIT LOG</div>
+                  <div className="section-kicker">TEAM PULSE & ACTIVITY LOG</div>
                   <h2 style={{ fontSize: '26px', margin: '4px 0 2px' }}>Team Activity Stream</h2>
                   <p style={{ fontSize: '12px', color: '#687d98', margin: '0' }}>Real-time updates across all workspace projects</p>
                 </div>
+                <button 
+                  className="ghost-button" 
+                  onClick={handleManualTestActivity} 
+                  style={{ fontSize: '11px', padding: '6px 12px', marginLeft: 'auto' }}
+                >
+                  🧪 Test Activity
+                </button>
               </div>
-              {supabaseUser ? <div className="activity-list" style={{ marginTop: '15px' }}>{activityItems.length ? activityItems.map((item) => (
-                <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }} key={item.id}>
-                  <div className={`avatar avatar-${item.color}`}>{item.avatar}</div>
-                  <div><p><strong>{item.text}</strong> <b>{item.subject}</b></p><span>{item.context}</span></div>
+              {supabaseUser ? (
+                <div className="activity-list" style={{ marginTop: '15px' }}>
+                  {activities.length > 0 ? (
+                    activities.map((item) => (
+                      <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }} key={item.id}>
+                        <div className={`avatar avatar-${item.color}`}>{item.avatar}</div>
+                        <div>
+                          <p><strong>{item.text}</strong> <b>{item.subject}</b></p>
+                          <span>{item.context}</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div>
+                      <p className="empty-state">No database activity yet. Click "🧪 Test Activity" to test the system, or perform actions like creating tasks/completing tasks.</p>
+                      <p className="empty-state" style={{ fontSize: '11px', marginTop: '10px' }}>⚠️ Make sure you've run the SQL script in Supabase to enable activity tracking.</p>
+                    </div>
+                  )}
                 </div>
-              )) : <p className="empty-state">No activity yet. Create a task, meeting, or project to see updates here.</p>}</div> : <div className="activity-list" style={{ marginTop: '15px' }}>
-                <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
-                  <div className="avatar avatar-orange">R</div>
-                  <div><p><strong>Rahul Sharma</strong> pushed 3 commits to <b>authentication-fix</b></p><span>12 minutes ago · Smart Agriculture</span></div>
+              ) : (
+                <div className="activity-list" style={{ marginTop: '15px' }}>
+                  <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
+                    <div className="avatar avatar-orange">R</div>
+                    <div><p><strong>Rahul Sharma</strong> pushed 3 commits to <b>authentication-fix</b></p><span>12 minutes ago · Smart Agriculture</span></div>
+                  </div>
+                  <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
+                    <div className="avatar avatar-pink">P</div>
+                    <div><p><strong>Priya Verma</strong> completed task <b>Dashboard UI Mockups</b></p><span>38 minutes ago · Cybersecurity Lab</span></div>
+                  </div>
+                  <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
+                    <div className="avatar avatar-teal">A</div>
+                    <div><p><strong>Aryan Kapoor</strong> uploaded file <b>research-notes-v2.pdf</b></p><span>1 hour ago · Smart Agriculture</span></div>
+                  </div>
+                  <div className="activity-item" style={{ padding: '12px 0' }}>
+                    <div className="avatar avatar-purple">S</div>
+                    <div><p><strong>Shruti Mehta</strong> created project <b>Mitro ML Pipeline</b></p><span>2 hours ago · Machine Learning</span></div>
+                  </div>
                 </div>
-                <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
-                  <div className="avatar avatar-pink">P</div>
-                  <div><p><strong>Priya Verma</strong> completed task <b>Dashboard UI Mockups</b></p><span>38 minutes ago · Cybersecurity Lab</span></div>
-                </div>
-                <div className="activity-item" style={{ padding: '12px 0', borderBottom: '1px solid #162438' }}>
-                  <div className="avatar avatar-teal">A</div>
-                  <div><p><strong>Aryan Kapoor</strong> uploaded file <b>research-notes-v2.pdf</b></p><span>1 hour ago · Smart Agriculture</span></div>
-                </div>
-                <div className="activity-item" style={{ padding: '12px 0' }}>
-                  <div className="avatar avatar-purple">S</div>
-                  <div><p><strong>Shruti Mehta</strong> created project <b>Mitro ML Pipeline</b></p><span>2 hours ago · Machine Learning</span></div>
-                </div>
-              </div>}
+              )}
             </section>
           ) : (
             /* DEFAULT HOME DASHBOARD PAGE */
@@ -1708,102 +1806,43 @@ function App() {
                 </section>
               )}
 
-              <section className="ai-priority">
-                <div className="ai-orb">✦</div>
-                <div className="ai-copy">
-                  <div className="section-kicker">AI PRIORITY <span className="live-dot">●</span></div>
-                  <h2>Your next best move</h2>
-                  <p>You have {myUserTasks.filter(t => !t.done).length} open tasks. <strong>{myUserTasks[0]?.title || 'Smart Agriculture'}</strong> needs attention first because of its High priority tag.</p>
-                  <div className="ai-actions">
-                    <button onClick={() => setShowAi(true)}>View priorities <span>→</span></button>
-                    <button className="ghost-button" onClick={() => setShowAi(true)}>Ask AI <span>↗</span></button>
-                  </div>
-                </div>
-                <div className="priority-ring">
-                  <strong>45</strong><span>doc progress</span>
-                </div>
-              </section>
+             <section className="ai-priority">
+  <div className="ai-orb">✦</div>
 
-              <div className="dashboard-grid">
-                {/* YOUR TASKS PANEL */}
-                <section className="panel tasks-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <div className="section-kicker">YOUR FOCUS</div>
-                      <h2>Your tasks <span className="count-pill">{myUserTasks.filter((task) => !task.done).length}</span></h2>
-                    </div>
-                    <button 
-                      className="text-button" 
-                      onClick={() => { 
-                        setIsWorkspaceTaskModal(false)
-                        setNewTaskProject(projectsList[0]?.name || '')
-                        setShowNewTaskModal(true) 
-                      }}
-                    >
-                      + Add task
-                    </button>
-                  </div>
+  <div className="ai-copy">
+    <div className="section-kicker">
+      AI PRIORITY <span className="live-dot">●</span>
+    </div>
 
-                  <div className="task-list">
-                    {myUserTasks.length === 0 ? (
-                      <p style={{ color: '#687c97', fontSize: '12px', padding: '15px 0' }}>No tasks assigned to your account.</p>
-                    ) : (
-                      myUserTasks.map((task) => (
-                        <div className={task.done ? 'task-row done' : 'task-row'} key={task.id} onClick={() => setSelectedTask(task)}>
-                          <button className="task-check" onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>{task.done ? '✓' : ''}</button>
-                          <div className="task-detail">
-                            <strong>{task.title}</strong>
-                            <span>
-                              <b className={`priority-dot ${task.priority.toLowerCase()}`}></b>
-                              {task.project} <i>·</i> {task.assignee} 
-                              {task.comments?.length > 0 && <small style={{ color: '#6fbaff', marginLeft: '6px' }}>💬 {task.comments.length}</small>}
-                            </span>
-                          </div>
-                          <div className="task-time">
-                            <strong>{task.time}</strong>
-                            <span className={`priority-text ${task.priority.toLowerCase()}`}>{task.priority}</span>
-                          </div>
-                          <span className="task-arrow">→</span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </section>
+    <h2>Your next best move</h2>
 
-                <section className="panel activity-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <div className="section-kicker">LIVE PULSE</div>
-                      <h2>Team activity</h2>
-                    </div>
-                    <button className="more-button">•••</button>
-                  </div>
-                  {supabaseUser ? <p className="empty-state">No activity yet.</p> : <div className="activity-list">
-                    <div className="activity-item">
-                      <div className="avatar avatar-orange">R</div>
-                      <div><p><strong>Rahul</strong> pushed code to <b>authentication-fix</b></p><span>12 minutes ago · Smart Agriculture</span></div>
-                    </div>
-                    <div className="activity-item">
-                      <div className="avatar avatar-pink">P</div>
-                      <div><p><strong>Priya</strong> completed <b>Dashboard UI</b></p><span>38 minutes ago · Cybersecurity Lab</span></div>
-                    </div>
-                    <div className="activity-item">
-                      <div className="avatar avatar-teal">A</div>
-                      <div><p><strong>Aryan</strong> uploaded <b>research-notes.pdf</b></p><span>1 hour ago · Smart Agriculture</span></div>
-                    </div>
-                  </div>}
-                  {!supabaseUser && <div className="team-status">
-                    <div className="status-avatars">
-                      <span className="avatar avatar-orange">R</span>
-                      <span className="avatar avatar-pink">P</span>
-                      <span className="avatar avatar-teal">A</span>
-                      <span className="avatar avatar-blue">N</span>
-                    </div>
-                    <span><b>4 members</b> active now</span>
-                    <i className="green-pulse"></i>
-                  </div>}
-                </section>
-              </div>
+    <p>
+      You have {myUserTasks.filter(t => !t.done).length} open tasks.
+      <strong>
+        {myUserTasks[0]?.title || 'Smart Agriculture'}
+      </strong>
+      needs attention first because of its High priority tag.
+    </p>
+
+    <div className="ai-actions">
+      <button onClick={() => setShowAi(true)}>
+        View priorities <span>→</span>
+      </button>
+
+      <button
+        className="ghost-button"
+        onClick={() => setShowAi(true)}
+      >
+        Ask AI <span>↗</span>
+      </button>
+    </div>
+  </div>
+
+  <div className="priority-ring">
+    <strong>45</strong>
+    <span>doc progress</span>
+  </div>
+</section>
 
               {/* PROJECTS QUICK OVERVIEW ON HOME PAGE */}
               <section className="projects-section">
@@ -2097,7 +2136,7 @@ function App() {
                       key={task.id} 
                       onClick={() => setSelectedTask(task)}
                     >
-                      <button className="task-check" onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>{task.done ? '✓' : ''}</button>
+                      <button className="task-check" disabled={task.assigneeId !== supabaseUser?.id} onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>{task.done ? '✓' : ''}</button>
                       <div className="task-detail">
                         <strong>{task.title}</strong>
                         <span>
@@ -2133,6 +2172,7 @@ function App() {
           onCreateTask={() => {
             setIsWorkspaceTaskModal(true)
             setNewTaskProject(selectedProject.name)
+            setNewTaskAssignee(selectedProject.members[0]?.name || '')
             setShowNewTaskModal(true)
           }}
           onScheduleMeeting={() => setShowNewMeetingModal(true)}
@@ -2167,6 +2207,7 @@ function App() {
               <button 
                 className="primary-button" 
                 style={{ background: selectedTask.done ? '#287e85' : '#438cf4', padding: '8px 14px', fontSize: '11px' }}
+                disabled={selectedTask.assigneeId !== supabaseUser?.id}
                 onClick={() => toggleTask(selectedTask.id)}
               >
                 {selectedTask.done ? '✓ Completed (Click to Reopen)' : 'Mark as Complete'}
@@ -2385,7 +2426,11 @@ function App() {
                   <label style={{ fontSize: '10px', color: '#778ca7', display: 'block', marginBottom: '4px', fontWeight: 'bold' }}>SELECT PROJECT</label>
                   <select
                     value={newTaskProject}
-                    onChange={(e) => setNewTaskProject(e.target.value)}
+                    onChange={(e) => {
+                      const project = projectsList.find((item) => item.name === e.target.value)
+                      setNewTaskProject(e.target.value)
+                      setNewTaskAssignee(project?.members[0]?.name || '')
+                    }}
                     style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
                   >
                     {projectsList.map(p => (
@@ -2403,9 +2448,8 @@ function App() {
                   onChange={(e) => setNewTaskAssignee(e.target.value)}
                   style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
                 >
-                  <option value="Shruti Mehta">Myself (Shruti Mehta - Product Lead)</option>
-                  {(selectedProject?.members || defaultMembers).map((m, idx) => (
-                    <option key={idx} value={m.name}>{m.name} ({m.role})</option>
+                  {taskMembers.map((m) => (
+                    <option key={m.id || m.name} value={m.name}>{m.name} ({m.role})</option>
                   ))}
                 </select>
               </div>
