@@ -96,11 +96,18 @@ export function mapTaskFromSupabase(task, project, assigneeProfile) {
 export async function ensureProfile(user, nameOverride) {
   if (!user) return null
   const name = nameOverride || getProfileName(user)
+  const { data: existingProfile, error: existingProfileError } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .maybeSingle()
+  if (existingProfileError) throw existingProfileError
+
   const profile = {
     id: user.id,
     name,
     email: user.email || '',
-    role: 'Student',
+    role: user.user_metadata?.account_role || existingProfile?.role || 'Student',
     initials: getInitials(name),
   }
   
@@ -171,13 +178,24 @@ export async function loadWorkspace(user) {
 
   const profileMap = new Map((profiles || []).map((item) => [item.id, item]))
   const projectMap = new Map((projects || []).map((project) => [project.id, project]))
-  const mappedProjects = (projects || []).map((project) => mapProjectFromSupabase(
-    project,
-    (allMemberships || [])
-      .filter((membership) => membership.project_id === project.id)
-      .map((membership, index) => mapMember(profileMap.get(membership.user_id), membership, index)),
-  ))
   const mappedTasks = (allTasks || []).map((task) => mapTaskFromSupabase(task, projectMap.get(task.project_id), profileMap.get(task.assigned_to)))
+  const mappedProjects = (projects || []).map((project) => {
+    const projectTasks = mappedTasks.filter((task) => task.projectId === project.id)
+    const completedTasks = projectTasks.filter((task) => task.done).length
+    const progress = projectTasks.length
+      ? Math.round((completedTasks / projectTasks.length) * 100)
+      : Number(project.progress || 0)
+
+    return {
+      ...mapProjectFromSupabase(
+        project,
+        (allMemberships || [])
+          .filter((membership) => membership.project_id === project.id)
+          .map((membership, index) => mapMember(profileMap.get(membership.user_id), membership, index)),
+      ),
+      progress,
+    }
+  })
 
   return { profile: currentProfile, projects: mappedProjects, tasks: mappedTasks, invitations: invitations || [] }
 }
@@ -210,6 +228,81 @@ export async function createProject(user, values) {
 
   const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle()
   return mapProjectFromSupabase(project, [mapMember(profile, { user_id: user.id, role: 'Product Lead' }, 0)])
+}
+
+export async function createProjectMentorCode(projectId) {
+  const { data, error } = await supabase.rpc('create_project_mentor_code', {
+    p_project_id: projectId,
+  })
+  if (error) throw error
+  if (!data) throw new Error('Supabase did not return a project share code.')
+  return data
+}
+
+export async function listProjectMeetings(projectIds) {
+  if (!projectIds.length) return []
+
+  const { data: meetings, error } = await supabase
+    .from('project_meetings')
+    .select('*, projects(name)')
+    .in('project_id', projectIds)
+    .order('starts_at', { ascending: true })
+  if (error) throw error
+
+  const hostIds = [...new Set((meetings || []).map((meeting) => meeting.created_by))]
+  const { data: hosts, error: hostsError } = hostIds.length
+    ? await supabase.from('profiles').select('id, name, display_name, initials').in('id', hostIds)
+    : { data: [], error: null }
+  if (hostsError) throw hostsError
+
+  const hostMap = new Map((hosts || []).map((host) => [host.id, host]))
+  return (meetings || []).map((meeting) => {
+    const host = hostMap.get(meeting.created_by)
+    const startsAt = new Date(meeting.starts_at)
+    const date = startsAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    const time = startsAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+
+    return {
+      id: meeting.id,
+      projectId: meeting.project_id,
+      project: meeting.projects?.name || 'Project',
+      title: meeting.title,
+      host: host?.display_name || host?.name || 'Team member',
+      hostAvatar: host?.initials || getInitials(host?.display_name || host?.name || 'Team member'),
+      time: `${date}, ${time} (${meeting.duration})`,
+      dateLabel: date,
+      link: meeting.link,
+      platform: meeting.platform,
+      status: startsAt.getTime() >= Date.now() ? 'Upcoming' : 'Past',
+    }
+  })
+}
+
+export async function createProjectMeeting(userId, projectId, meeting) {
+  const { data, error } = await supabase
+    .from('project_meetings')
+    .insert({
+      project_id: projectId,
+      created_by: userId,
+      title: meeting.title,
+      link: meeting.link,
+      starts_at: meeting.startsAt,
+      duration: meeting.duration,
+      platform: meeting.platform,
+    })
+    .select('id')
+    .single()
+  if (error) throw error
+  return data
+}
+
+export async function joinProjectAsMentor(code) {
+  const { data, error } = await supabase.rpc('join_project_as_mentor', {
+    p_code: code.trim().toUpperCase(),
+  })
+  if (error) throw error
+  if (!data) throw new Error('No project was found for that code.')
+  return data
 }
 
 export async function createTask(user, values) {
@@ -584,16 +677,21 @@ export async function checkOnboardingCompleted(userId) {
 }
 
 export async function saveOnboardingData(userId, onboardingData) {
+  const isMentor = onboardingData.role === 'Faculty/Mentor' || onboardingData.role === 'Mentor'
+  const profileUpdates = {
+    display_name: onboardingData.displayName,
+    role: isMentor ? 'Mentor' : onboardingData.role,
+    onboarding_completed: true,
+  }
+  if (!isMentor) {
+    profileUpdates.year = onboardingData.year
+    profileUpdates.focus_area = onboardingData.focusArea
+  }
+
   try {
     const { data, error } = await supabase
       .from('profiles')
-      .update({
-        display_name: onboardingData.displayName,
-        role: onboardingData.role,
-        year: onboardingData.year,
-        focus_area: onboardingData.focusArea,
-        onboarding_completed: true,
-      })
+      .update(profileUpdates)
       .eq('id', userId)
       .select()
       .single()

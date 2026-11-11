@@ -7,8 +7,10 @@ import {
   checkExistingMembership,
   checkOnboardingCompleted,
   checkPendingInvitation,
+  createProjectMentorCode,
   createProjectMessage,
   createProject,
+  createProjectMeeting,
   createProjectInvitation,
   createTask,
   declineProjectInvitation,
@@ -18,8 +20,10 @@ import {
   getProjectInvitations,
   insertTestActivity,
   listAllProjectFiles,
+  listProjectMeetings,
   listMyProjectFiles,
   listProjectFiles,
+  joinProjectAsMentor,
   loadActivities,
   loadProjectMessages,
   loadWorkspace,
@@ -32,6 +36,18 @@ import {
 import Onboarding from './Onboarding'
 
 const navItems = [['⌂', 'Home'], ['◈', 'Projects'], ['✓', 'Tasks'], ['◫', 'Meetings'], ['◌', 'Activity']]
+
+function isEmailRateLimitError(error) {
+  const errorDetails = `${error?.code || ''} ${error?.message || ''}`.toLowerCase()
+  return /over_email_send_rate_limit|email.{0,30}rate|rate.{0,30}email/.test(errorDetails)
+}
+
+function isUnconfirmedEmailError(error) {
+  return error?.code === 'email_not_confirmed'
+    || /email not confirmed/.test(error?.message?.toLowerCase() || '')
+}
+
+const emailRateLimitMessage = 'Supabase has temporarily blocked this project from sending authentication emails, including signup confirmations and password resets. Wait for the project email limit to clear and avoid repeated attempts. To send emails to new addresses, configure custom SMTP and review Authentication → Rate Limits in your Supabase Dashboard.'
 
 const _initialProjects = [
   { 
@@ -230,7 +246,7 @@ const workspaceFiles = [
   { id: 'f5', name: 'Sprint report.pdf', type: 'PDF', category: 'Reports', size: '640 KB', uploadedBy: 'Shruti Mehta', date: '1 Sep 2026', icon: '▤' },
 ]
 
-function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticated, onClose, onCreateTask, onScheduleMeeting, onAddMember, onToggleTask, onUpdateTask, onOpenTask }) {
+function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticated, readOnly = false, onRefresh, onClose, onCreateTask, onScheduleMeeting, onAddMember, onToggleTask, onUpdateTask, onOpenTask }) {
   const [activeTab, setActiveTab] = useState('Overview')
   const [fileFilter, setFileFilter] = useState('All')
   const [messages, setMessages] = useState([])
@@ -240,13 +256,48 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
   const [isSendingMessage, setIsSendingMessage] = useState(false)
   const [projectFiles, setProjectFiles] = useState([])
   const [isUploadingFile, setIsUploadingFile] = useState(false)
+  const [mentorCode, setMentorCode] = useState('')
+  const [mentorCodeError, setMentorCodeError] = useState('')
+  const [mentorCodeCopied, setMentorCodeCopied] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState('')
   const projectTasks = tasks.filter((task) => task.projectId === project.id || task.project === project.name)
   const projectMeetings = meetings.filter((meeting) => meeting.project === project.name)
   const completedTasks = projectTasks.filter((task) => task.done).length
+  const inProgressTasks = projectTasks.filter((task) => !task.done && /progress/i.test(task.status || ''))
+  const notStartedTasks = projectTasks.filter((task) => !task.done && !/progress/i.test(task.status || ''))
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const overdueTasks = projectTasks.filter((task) => {
+    if (task.done || !task.dueDate) return false
+    const deadline = new Date(`${task.dueDate}T00:00:00`)
+    return !Number.isNaN(deadline.getTime()) && deadline < today
+  })
+  const memberContributions = project.members.map((member) => {
+    const assignedTasks = projectTasks.filter((task) => task.assigneeId === member.id)
+    const completedAssignedTasks = assignedTasks.filter((task) => task.done).length
+    return {
+      ...member,
+      assignedTaskCount: assignedTasks.length,
+      completedTaskCount: completedAssignedTasks,
+      completionShare: completedTasks
+        ? Math.round((completedAssignedTasks / completedTasks) * 100)
+        : 0,
+    }
+  })
   const files = isAuthenticated
     ? (fileFilter === 'All' ? projectFiles : projectFiles.filter((file) => file.category === fileFilter))
     : (fileFilter === 'All' ? workspaceFiles : workspaceFiles.filter((file) => file.category === fileFilter))
   const categories = ['All', 'Documents', 'Presentations', 'Code', 'Images', 'Reports']
+
+  useEffect(() => {
+    if (!isAuthenticated || readOnly || !project.id) return undefined
+    let isMounted = true
+    createProjectMentorCode(project.id)
+      .then((code) => isMounted && setMentorCode(code))
+      .catch((error) => isMounted && setMentorCodeError(error.message || 'Unable to load a mentor code.'))
+    return () => { isMounted = false }
+  }, [isAuthenticated, project.id, readOnly])
 
   useEffect(() => {
     if (!isAuthenticated || !project.id) return undefined
@@ -280,7 +331,7 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
   }
 
   useEffect(() => {
-    if (!isAuthenticated || !project.id || !currentUser?.id) return undefined
+    if (!isAuthenticated || readOnly || !project.id || !currentUser?.id) return undefined
 
     let isMounted = true
     const channel = supabase.channel(`project-chat:${project.id}`, {
@@ -322,7 +373,7 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
       supabase.removeChannel(channel)
       setOnlineMemberIds(new Set())
     }
-  }, [currentUser, isAuthenticated, project.id])
+  }, [currentUser, isAuthenticated, project.id, readOnly])
 
   const sendMessage = async (event) => {
     event.preventDefault()
@@ -350,9 +401,27 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
     }
   }
 
+  const refreshProgress = async () => {
+    if (!onRefresh || isRefreshing) return
+    setIsRefreshing(true)
+    setRefreshError('')
+    try {
+      await onRefresh()
+    } catch (error) {
+      setRefreshError(error.message || 'Unable to refresh project progress.')
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
   const isMemberOnline = (member) => member.id === currentUser?.id || onlineMemberIds.has(member.id)
 
+  useEffect(() => {
+    if (readOnly && activeTab === 'Chat') setActiveTab('Overview')
+  }, [activeTab, readOnly])
+
   const updateTask = (taskId, field, value) => {
+    if (readOnly) return
     const task = projectTasks.find((item) => item.id === taskId)
     if (field === 'status' && (value === 'Completed' || task?.done) && task?.assigneeId !== currentUser?.id) return
     onUpdateTask(taskId, { [field]: value, ...(field === 'status' ? { done: value === 'Completed' } : {}) })
@@ -360,10 +429,10 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
 
   const taskRow = (task) => (
     <div className={task.done ? 'workspace-task done' : 'workspace-task'} key={task.id}>
-      <button className="task-check" disabled={task.assigneeId !== currentUser?.id} onClick={() => onToggleTask(task.id)}>{task.done ? '✓' : ''}</button>
+      <button className="task-check" disabled={readOnly || task.assigneeId !== currentUser?.id} onClick={() => onToggleTask(task.id)}>{task.done ? '✓' : ''}</button>
       <button className="workspace-task-title" onClick={() => onOpenTask(task)}>{task.title}<small>{task.estimatedHours ? `${task.estimatedHours}h estimated` : 'Effort not set'}</small></button>
-      <select value={task.priority} onChange={(event) => updateTask(task.id, 'priority', event.target.value)} aria-label={`Priority for ${task.title}`}><option>High</option><option>Medium</option><option>Low</option></select>
-      <select value={task.assignee} onChange={(event) => {
+      <select disabled={readOnly} value={task.priority} onChange={(event) => updateTask(task.id, 'priority', event.target.value)} aria-label={`Priority for ${task.title}`}><option>High</option><option>Medium</option><option>Low</option></select>
+      <select disabled={readOnly} value={task.assignee} onChange={(event) => {
         const member = project.members.find((item) => item.name === event.target.value)
         onUpdateTask(task.id, {
           assignee: event.target.value,
@@ -372,25 +441,61 @@ function ProjectWorkspace({ project, tasks, meetings, currentUser, isAuthenticat
         })
       }} aria-label={`Assignee for ${task.title}`}>{project.members.map((member) => <option key={member.name}>{member.name}</option>)}</select>
       <span className="workspace-task-due">{task.time || formatDateDisplay(task.dueDate)}</span>
-      <select value={task.done ? 'Completed' : (task.status || 'To Do')} onChange={(event) => updateTask(task.id, 'status', event.target.value)} aria-label={`Status for ${task.title}`}><option>To Do</option><option>In Progress</option><option>Completed</option></select>
+      <select disabled={readOnly} value={task.done ? 'Completed' : (task.status || 'To Do')} onChange={(event) => updateTask(task.id, 'status', event.target.value)} aria-label={`Status for ${task.title}`}><option>To Do</option><option>In Progress</option><option>Completed</option></select>
     </div>
   )
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="workspace-sheet workspace-v2" onClick={(event) => event.stopPropagation()}>
-        <div className="workspace-header"><div className="workspace-title-row"><button className="back-projects" onClick={onClose}>← Back to Projects</button><span className="section-kicker">{project.type} PROJECT</span><h2>{project.name}</h2><p>{project.description}</p></div><div className="workspace-header-meta"><span className="status-badge">{project.progress < 50 ? 'At Risk' : 'On Track'}</span><strong>{project.progress}%</strong><small>Target · {project.due}</small></div></div>
-        <div className="workspace-tabs" role="tablist">{['Overview', 'Tasks', 'Chat', 'Files', 'Meetings'].map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>{tab}</button>)}</div>
+        <div className="workspace-header"><div className="workspace-title-row"><button className="back-projects" onClick={onClose}>← Back to Projects</button><span className="section-kicker">{project.type} PROJECT</span><h2>{project.name}</h2><p>{project.description}</p></div><div className="workspace-header-meta"><span className="status-badge">{project.progress < 50 ? 'At Risk' : 'On Track'}</span><strong>{project.progress}%</strong><small>Target · {project.due}</small>{readOnly && <button className="ghost-button" onClick={refreshProgress} disabled={isRefreshing}>{isRefreshing ? 'Refreshing...' : 'Refresh progress'}</button>}</div></div>
+        <div className="workspace-tabs" role="tablist">{['Overview', 'Tasks', ...(!readOnly ? ['Chat'] : []), 'Files', 'Meetings'].map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>{tab}</button>)}</div>
+        {refreshError && <p className="chat-error">{refreshError}</p>}
 
-        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>{project.members.filter(isMemberOnline).length} online now</span></div></div>{project.githubUrl && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">GITHUB REPOSITORY</span><h3>Project Code</h3></div><a href={project.githubUrl} target="_blank" rel="noreferrer" className="primary-button compact-button">Open Repository ↗</a></div><div className="github-project-row"><span><strong>{project.githubUrl}</strong><small>Connected GitHub repository for this project</small></span></div></div>}<div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div><button className="add-member-btn" onClick={onAddMember}>+ Add Member</button></div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}><i className={isMemberOnline(member) ? 'presence-dot online' : 'presence-dot'} />{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{isMemberOnline(member) ? 'Active now' : 'Offline'} · {member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
+        {readOnly && activeTab === 'Overview' && <>
+          <div className="workspace-section">
+            <div className="workspace-section-heading">
+              <div><span className="section-kicker">PROJECT ANALYTICS</span><h3>Progress breakdown</h3></div>
+              <span className="live-label">Read-only mentor view</span>
+            </div>
+            <div className="workspace-stats">
+              <div className="w-stat-card"><label>COMPLETED</label><strong>{completedTasks}</strong><span>Tasks finished</span></div>
+              <div className="w-stat-card"><label>IN PROGRESS</label><strong>{inProgressTasks.length}</strong><span>Active tasks</span></div>
+              <div className="w-stat-card"><label>NOT STARTED</label><strong>{notStartedTasks.length}</strong><span>Open tasks</span></div>
+              <div className="w-stat-card"><label>OVERDUE</label><strong>{overdueTasks.length}</strong><span>Past deadline</span></div>
+            </div>
+            <p className="empty-state">Progress is based on task status. Member contribution below is based on tasks assigned and completed.</p>
+          </div>
+          <div className="workspace-section">
+            <div className="workspace-section-heading">
+              <div><span className="section-kicker">TEAM CONTRIBUTIONS</span><h3>Task contribution by member</h3></div>
+            </div>
+            {memberContributions.length ? (
+              <div className="members-grid">
+                {memberContributions.map((member) => (
+                  <div className="member-chip member-card" key={member.id}>
+                    <div className={`avatar avatar-${member.color || 'purple'}`}>{member.avatar || member.name.charAt(0)}</div>
+                    <div>
+                      <strong>{member.name}</strong>
+                      <span>{member.assignedTaskCount} assigned · {member.completedTaskCount} completed · {member.completionShare}% of completed tasks</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="empty-state">No team members are listed for this project yet.</p>}
+            <p className="empty-state">Contribution reflects assigned task completion; it does not measure commits, time spent, or work outside Groupify tasks.</p>
+          </div>
+        </>}
 
-        {activeTab === 'Tasks' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">DELIVERY BOARD</span><h3>All project tasks <span className="count-pill">{projectTasks.length}</span></h3></div><button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button></div><div className="task-table-head"><span>Task</span><span>Priority</span><span>Assignee</span><span>Due</span><span>Status</span></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div>}
+        {activeTab === 'Overview' && <><div className="workspace-stats"><div className="w-stat-card"><label>PROGRESS</label><strong>{project.progress}%</strong><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div></div><div className="w-stat-card"><label>TOTAL TASKS</label><strong>{projectTasks.length}</strong><span>{completedTasks} completed</span></div><div className="w-stat-card"><label>TEAM MEMBERS</label><strong>{project.members.length}</strong><span>{project.members.filter(isMemberOnline).length} online now</span></div></div>{!readOnly && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">MENTOR ACCESS</span><h3>Share this project</h3></div></div>{mentorCode ? <div className="github-project-row"><span><strong>{mentorCode}</strong><small>Share this code with a mentor so they can monitor this project's progress.</small></span><button className="primary-button compact-button" onClick={() => navigator.clipboard.writeText(mentorCode).then(() => setMentorCodeCopied(true)).catch((error) => setMentorCodeError(error.message || 'Unable to copy the code.'))}>{mentorCodeCopied ? 'Copied' : 'Copy code'}</button></div> : <p className="empty-state">{mentorCodeError || 'Creating your mentor code...'}</p>}{mentorCodeError && mentorCode && <p className="chat-error">{mentorCodeError}</p>}</div>}{project.githubUrl && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">GITHUB REPOSITORY</span><h3>Project Code</h3></div><a href={project.githubUrl} target="_blank" rel="noreferrer" className="primary-button compact-button">Open Repository ↗</a></div><div className="github-project-row"><span><strong>{project.githubUrl}</strong><small>Connected GitHub repository for this project</small></span></div></div>}<div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TEAM MEMBERS</span><h3>Everyone on this project</h3></div>{!readOnly && <button className="add-member-btn" onClick={onAddMember}>+ Add Member</button>}</div><div className="members-grid">{project.members.map((member) => <div className="member-chip member-card" key={member.name}><div className={`avatar avatar-${member.color || 'purple'}`}><i className={isMemberOnline(member) ? 'presence-dot online' : 'presence-dot'} />{member.avatar || member.name.charAt(0)}</div><div><strong>{member.name}</strong><span>{isMemberOnline(member) ? 'Active now' : 'Offline'} · {member.role}</span></div></div>)}</div></div><div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT TASKS</span><h3>Current work <span className="count-pill">{projectTasks.length}</span></h3></div>{!readOnly && <button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button>}</div><div className="workspace-task-list">{projectTasks.length ? projectTasks.slice(0, 4).map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div></>}
 
-        {activeTab === 'Chat' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CONVERSATION</span><h3>Team chat</h3></div><span className="live-label">● {project.members.filter(isMemberOnline).length} online</span></div><div className="chat-members">{project.members.filter(isMemberOnline).map((member) => <div className="chat-member" key={member.id}><div className={`avatar avatar-${member.color || 'purple'}`}><i className="presence-dot online" />{member.avatar || member.name.charAt(0)}</div><span>{member.name.split(' ')[0]}<small>Active</small></span></div>)}</div>{chatError && <p className="chat-error">{chatError}</p>}{messages.length ? <div className="chat-feed">{messages.map((message) => <div className={message.senderId === currentUser?.id ? 'chat-message mine' : 'chat-message'} key={message.id}><div className={`avatar avatar-${message.color || 'blue'}`}>{message.avatar}</div><div><div className="chat-meta"><strong>{message.senderId === currentUser?.id ? 'You' : message.author}</strong><span>{message.time}</span></div><p>{message.text}</p></div></div>)}</div> : <p className="empty-state">No messages yet. Start the conversation.</p>}<form className="chat-composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Message your project team..." aria-label="Message your project team" disabled={isSendingMessage} /><button type="submit" aria-label="Send message" disabled={!messageDraft.trim() || isSendingMessage}>↑</button></form></div>}
+        {activeTab === 'Tasks' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">DELIVERY BOARD</span><h3>All project tasks <span className="count-pill">{projectTasks.length}</span></h3></div>{!readOnly && <button className="primary-button compact-button" onClick={onCreateTask}>+ Create Task</button>}</div><div className="task-table-head"><span>Task</span><span>Priority</span><span>Assignee</span><span>Due</span><span>Status</span></div><div className="workspace-task-list">{projectTasks.length ? projectTasks.map(taskRow) : <p className="empty-state">No tasks created for this project yet.</p>}</div></div>}
 
-        {activeTab === 'Files' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT FILES</span><h3>Shared resources</h3></div><><input id={`project-file-${project.id}`} className="project-file-input" type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip" onChange={handleFileUpload} disabled={isUploadingFile} /><label className="primary-button compact-button project-file-button" htmlFor={`project-file-${project.id}`}>{isUploadingFile ? 'Uploading...' : '↥ Upload file'}</label></></div><div className="file-filters">{categories.map((category) => <button className={fileFilter === category ? 'selected' : ''} key={category} onClick={() => setFileFilter(category)}>{category}</button>)}</div>{files.length ? <div className="file-grid">{files.map((file) => <article className="file-card" key={file.id}><div className="file-icon">{file.icon}</div><a className="file-more" aria-label={`Open ${file.name}`} href={file.url} target="_blank" rel="noreferrer">↗</a><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>Uploaded by {file.uploadedBy}<br />{file.date}</small></article>)}</div> : <p className="empty-state">No files yet. Upload a document or image to share it with the project.</p>}</div>}
+        {!readOnly && activeTab === 'Chat' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CONVERSATION</span><h3>Team chat</h3></div><span className="live-label">● {project.members.filter(isMemberOnline).length} online</span></div><div className="chat-members">{project.members.filter(isMemberOnline).map((member) => <div className="chat-member" key={member.id}><div className={`avatar avatar-${member.color || 'purple'}`}><i className="presence-dot online" />{member.avatar || member.name.charAt(0)}</div><span>{member.name.split(' ')[0]}<small>Active</small></span></div>)}</div>{chatError && <p className="chat-error">{chatError}</p>}{messages.length ? <div className="chat-feed">{messages.map((message) => <div className={message.senderId === currentUser?.id ? 'chat-message mine' : 'chat-message'} key={message.id}><div className={`avatar avatar-${message.color || 'blue'}`}>{message.avatar}</div><div><div className="chat-meta"><strong>{message.senderId === currentUser?.id ? 'You' : message.author}</strong><span>{message.time}</span></div><p>{message.text}</p></div></div>)}</div> : <p className="empty-state">No messages yet. Start the conversation.</p>}<form className="chat-composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Message your project team..." aria-label="Message your project team" disabled={isSendingMessage} /><button type="submit" aria-label="Send message" disabled={!messageDraft.trim() || isSendingMessage}>↑</button></form></div>}
 
-        {activeTab === 'Meetings' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CALENDAR</span><h3>Meetings</h3></div><button className="primary-button compact-button" onClick={onScheduleMeeting}>+ Schedule Meeting</button></div>{projectMeetings.length ? <div className="meeting-group"><span className="meeting-label">UPCOMING MEETINGS</span>{projectMeetings.map((meeting) => <div className="meeting-card" key={meeting.id}><div className="meeting-icon">◷</div><div><strong>{meeting.title}</strong><span>{meeting.time}</span><small>{meeting.host || 'Project team'} · {meeting.status}</small></div><span className="status-badge">Upcoming</span></div>)}</div> : <p className="empty-state">No meetings yet.</p>}{!isAuthenticated && <div className="meeting-group"><span className="meeting-label">PAST MEETINGS</span><div className="meeting-card past"><div className="meeting-icon">✓</div><div><strong>Weekly project review</strong><span>2 Sep 2026 · 3:00 PM</span><small>4 participants · Past</small></div><button className="ghost-button" onClick={() => window.alert('AI summary generated from the meeting transcript.')}>Generate AI Summary</button></div><div className="meeting-summary"><strong>AI meeting summary</strong><p><b>Key Decisions:</b> Finalize the dashboard flow and auth API integration.</p><p><b>Tasks Assigned:</b> Rahul owns the login API; Shruti owns dashboard UI.</p><p><b>Deadlines:</b> First review by Wednesday.</p><p><b>Open Questions:</b> Confirm production deployment environment.</p></div></div>}</div>}
+        {activeTab === 'Files' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT FILES</span><h3>Shared resources</h3></div>{!readOnly && <><input id={`project-file-${project.id}`} className="project-file-input" type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip" onChange={handleFileUpload} disabled={isUploadingFile} /><label className="primary-button compact-button project-file-button" htmlFor={`project-file-${project.id}`}>{isUploadingFile ? 'Uploading...' : '↥ Upload file'}</label></>}</div><div className="file-filters">{categories.map((category) => <button className={fileFilter === category ? 'selected' : ''} key={category} onClick={() => setFileFilter(category)}>{category}</button>)}</div>{files.length ? <div className="file-grid">{files.map((file) => <article className="file-card" key={file.id}><div className="file-icon">{file.icon}</div><a className="file-more" aria-label={`Open ${file.name}`} href={file.url} target="_blank" rel="noreferrer">↗</a><strong>{file.name}</strong><span>{file.type} · {file.size}</span><small>Uploaded by {file.uploadedBy}<br />{file.date}</small></article>)}</div> : <p className="empty-state">No files yet. Upload a document or image to share it with the project.</p>}</div>}
+
+        {activeTab === 'Meetings' && <div className="workspace-section"><div className="workspace-section-heading"><div><span className="section-kicker">PROJECT CALENDAR</span><h3>Meetings</h3></div><button className="primary-button compact-button" onClick={onScheduleMeeting}>+ Schedule Meeting</button></div>{projectMeetings.length ? <div className="meeting-group"><span className="meeting-label">PROJECT MEETINGS</span>{projectMeetings.map((meeting) => <div className="meeting-card" key={meeting.id}><div className="meeting-icon">◷</div><div><strong>{meeting.title}</strong><span>{meeting.time}</span><small>{meeting.host || 'Project team'} · {meeting.status}</small></div><a className="primary-button compact-button" href={meeting.link} target="_blank" rel="noreferrer">Join meeting ↗</a></div>)}</div> : <p className="empty-state">No meetings yet.</p>}{!isAuthenticated && <div className="meeting-group"><span className="meeting-label">PAST MEETINGS</span><div className="meeting-card past"><div className="meeting-icon">✓</div><div><strong>Weekly project review</strong><span>2 Sep 2026 · 3:00 PM</span><small>4 participants · Past</small></div><button className="ghost-button" onClick={() => window.alert('AI summary generated from the meeting transcript.')}>Generate AI Summary</button></div><div className="meeting-summary"><strong>AI meeting summary</strong><p><b>Key Decisions:</b> Finalize the dashboard flow and auth API integration.</p><p><b>Tasks Assigned:</b> Rahul owns the login API; Shruti owns dashboard UI.</p><p><b>Deadlines:</b> First review by Wednesday.</p><p><b>Open Questions:</b> Confirm production deployment environment.</p></div></div>}</div>}
         <button className="workspace-close" onClick={onClose}>Close Workspace</button>
       </div>
     </div>
@@ -429,6 +534,10 @@ function App() {
   const [showNewMeetingModal, setShowNewMeetingModal] = useState(false)
   const [isWorkspaceTaskModal, setIsWorkspaceTaskModal] = useState(false)
   const [showAddMemberModal, setShowAddMemberModal] = useState(false)
+  const [showDeleteAccountDialog, setShowDeleteAccountDialog] = useState(false)
+  const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState('')
+  const [deleteAccountError, setDeleteAccountError] = useState('')
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [aiInput, setAiInput] = useState('')
   const [aiMessages, setAiMessages] = useState([])
@@ -439,6 +548,25 @@ function App() {
   const [authPassword, setAuthPassword] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
   const [authMessage, setAuthMessage] = useState('')
+  const [canResendConfirmation, setCanResendConfirmation] = useState(false)
+  const [authRole, setAuthRole] = useState('Student')
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(false)
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmNewPassword, setConfirmNewPassword] = useState('')
+  const [passwordRecoveryMessage, setPasswordRecoveryMessage] = useState('')
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false)
+  const [mentorProjectCode, setMentorProjectCode] = useState('')
+  const [mentorCodeMessage, setMentorCodeMessage] = useState('')
+  const [isJoiningMentorProject, setIsJoiningMentorProject] = useState(false)
+
+  const isMentor = ['Mentor', 'Faculty/Mentor'].includes(profile?.role)
+  const visibleNavItems = isMentor
+    ? navItems.filter(([, label]) => label === 'Projects' || label === 'Meetings')
+    : navItems
+
+  useEffect(() => {
+    setActiveNav(isMentor ? 'Projects' : 'Home')
+  }, [isMentor])
 
   const sendAiMessage = (message = aiInput) => {
     const question = message.trim()
@@ -505,6 +633,7 @@ function App() {
 
   const handleAuthSubmit = async (event) => {
     event.preventDefault()
+    setCanResendConfirmation(false)
     if (!authEmail.trim() || authPassword.length < 6) {
       setAuthMessage('Enter an email and a password with at least 6 characters.')
       return
@@ -513,6 +642,27 @@ function App() {
     setAuthLoading(true)
     setAuthMessage('')
     try {
+      const validateLoginRole = async (user) => {
+        const { data: userProfile, error } = await supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', user.id)
+          .maybeSingle()
+        if (error) {
+          await supabase.auth.signOut()
+          throw error
+        }
+
+        const actualRole = userProfile?.role || user.user_metadata?.account_role || 'Student'
+        const isMentorAccount = ['Mentor', 'Faculty/Mentor'].includes(actualRole)
+        if (isMentorAccount !== (authRole === 'Mentor')) {
+          await supabase.auth.signOut()
+          setAuthMessage(`This account is registered as a ${isMentorAccount ? 'mentor' : 'student'}. Choose the matching login option.`)
+          return false
+        }
+        return true
+      }
+
       const response = authMode === 'login'
         ? await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword })
         : await supabase.auth.signUp({ 
@@ -520,44 +670,26 @@ function App() {
             password: authPassword,
             options: {
               emailRedirectTo: window.location.origin,
-              // Disable email confirmation to avoid rate limiting
-              // This allows immediate signup without email verification
               data: {
-                // This metadata can help identify development signups
-                skip_email_verification: true
+                account_role: authRole
               }
             }
           })
 
       if (response.error) throw response.error
       
-      // Handle signup success - check if session exists (auto-login) or needs confirmation
+      // Supabase returns no session when email confirmation is enabled.
       if (authMode === 'signup') {
         if (response.data.session) {
-          // Auto-login successful (email confirmation disabled)
           setShowAuthModal(false)
           setAuthEmail('')
           setAuthPassword('')
         } else {
-          // Email confirmation required - try to auto-confirm by signing in
-          try {
-            const loginResponse = await supabase.auth.signInWithPassword({ 
-              email: authEmail.trim(), 
-              password: authPassword 
-            })
-            if (loginResponse.data.session) {
-              setShowAuthModal(false)
-              setAuthEmail('')
-              setAuthPassword('')
-            } else {
-              setAuthMessage('Account created. Please verify your email before logging in.')
-            }
-          } catch (loginError) {
-            setAuthMessage('Account created. Please verify your email before logging in.')
-          }
+          setCanResendConfirmation(true)
+          setAuthMessage('Account created, but Supabase did not provide a signed-in session. Check your email and spam folder for a confirmation link. If you did not receive it, wait for the email rate limit to clear or configure custom SMTP, then resend the confirmation.')
         }
       } else {
-        // Login successful
+        if (!await validateLoginRole(response.data.user)) return
         setShowAuthModal(false)
         setAuthEmail('')
         setAuthPassword('')
@@ -565,20 +697,178 @@ function App() {
     } catch (error) {
       console.error('Auth error:', error)
       // Provide more specific error messages
-      if (error.message && error.message.includes('rate limit')) {
-        setAuthMessage('Email rate limit exceeded. Please wait 5-10 minutes and try again, or disable email confirmation in Supabase Dashboard.')
-      } else if (error.message && error.message.includes('email')) {
-        setAuthMessage('Email service unavailable. Please try again later.')
+      if (isUnconfirmedEmailError(error)) {
+        setCanResendConfirmation(true)
+        setAuthMessage('This email address is not confirmed yet. Resend the confirmation email, then check your inbox and spam folder.')
+      } else if (isEmailRateLimitError(error)) {
+        setCanResendConfirmation(authMode === 'signup')
+        setAuthMessage(emailRateLimitMessage)
       } else if (error.message && error.message.includes('Invalid login')) {
         setAuthMessage('Invalid email or password. Please check your credentials.')
       } else if (error.message && error.message.includes('disabled')) {
         setAuthMessage('Email signups are disabled in Supabase. Enable them in Authentication → Providers.')
       } else {
-        setAuthMessage(authMode === 'login' ? 'Unable to log in with those credentials.' : 'Unable to create the account.')
+        const action = authMode === 'login' ? 'sign in' : 'create the account'
+        const details = [error.message, error.code && `Code: ${error.code}`].filter(Boolean).join(' — ')
+        const emailDeliveryFailure = /email|smtp|mailer|send/i.test(error.message || '')
+        setAuthMessage(
+          `${emailDeliveryFailure ? 'Supabase could not send the authentication email' : `Unable to ${action}`}${details ? `: ${details}` : ''}.${emailDeliveryFailure ? ' Check Supabase Authentication logs and your SMTP provider delivery logs.' : ''}`,
+        )
       }
     } finally {
       setAuthLoading(false)
     }
+  }
+
+  const handleResendConfirmation = async () => {
+    if (!authEmail.trim() || authLoading) return
+
+    setAuthLoading(true)
+    setAuthMessage('')
+    try {
+      const { error } = await supabase.auth.resend({
+        type: 'signup',
+        email: authEmail.trim(),
+        options: { emailRedirectTo: window.location.origin },
+      })
+      if (error) throw error
+      setAuthMessage('Confirmation email sent. Check your inbox and spam folder.')
+    } catch (error) {
+      console.error('Confirmation email resend failed:', error)
+      setAuthMessage(
+        isEmailRateLimitError(error)
+          ? emailRateLimitMessage
+          : `Unable to resend the confirmation email${error.message ? `: ${error.message}` : '.'}${error.code ? ` (code: ${error.code})` : ''}. Check Supabase Authentication logs and your SMTP provider delivery logs.`,
+      )
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handleForgotPassword = async (event) => {
+    event.preventDefault()
+    if (!authEmail.trim()) {
+      setAuthMessage('Enter your email address first, then request a reset link.')
+      return
+    }
+
+    setAuthLoading(true)
+    setAuthMessage('')
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(authEmail.trim(), {
+        redirectTo: window.location.origin,
+      })
+      if (error) throw error
+      setAuthMessage('If an account exists for that email, a password reset link has been sent. Check spam; if no email arrives, configure SMTP in Supabase Authentication settings.')
+    } catch (error) {
+      console.error('Password reset request failed:', error)
+      setAuthMessage(
+        isEmailRateLimitError(error)
+          ? emailRateLimitMessage
+          : `Unable to send a password reset email${error.message ? `: ${error.message}` : '.'}${error.code ? ` (code: ${error.code})` : ''}. Check Supabase Authentication logs and your SMTP provider delivery logs.`,
+      )
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handlePasswordUpdate = async (event) => {
+    event.preventDefault()
+    if (newPassword.length < 6) {
+      setPasswordRecoveryMessage('Password must contain at least 6 characters.')
+      return
+    }
+    if (newPassword !== confirmNewPassword) {
+      setPasswordRecoveryMessage('The passwords do not match.')
+      return
+    }
+
+    setIsUpdatingPassword(true)
+    setPasswordRecoveryMessage('')
+    let updatedEmail = ''
+    let passwordWasUpdated = false
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPassword })
+      if (error) throw error
+      passwordWasUpdated = true
+      const { data: userData, error: userError } = await supabase.auth.getUser()
+      if (userError) throw userError
+      updatedEmail = userData.user?.email || ''
+      if (!updatedEmail) {
+        throw new Error('Your password was changed, but we could not find the account email. Please sign in with your new password.')
+      }
+
+      const { error: signOutError } = await supabase.auth.signOut()
+      if (signOutError) throw signOutError
+      const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+        email: updatedEmail,
+        password: newPassword,
+      })
+      if (loginError) throw loginError
+
+      window.history.replaceState({}, document.title, window.location.pathname)
+      setIsPasswordRecovery(false)
+      setSupabaseUser(loginData.user)
+      setAuthEmail(updatedEmail)
+      setAuthPassword('')
+      setAuthMessage('')
+      setNewPassword('')
+      setConfirmNewPassword('')
+    } catch (error) {
+      console.error('Password update failed:', error)
+      if (passwordWasUpdated) {
+        await supabase.auth.signOut()
+        setIsPasswordRecovery(false)
+        setAuthEmail(updatedEmail)
+        setAuthMessage('Your password was changed. Automatic sign-in failed; sign in using your new password.')
+        setPasswordRecoveryMessage('')
+      } else {
+        setPasswordRecoveryMessage(error.message || 'Unable to update your password. Request a new reset link and try again.')
+      }
+    } finally {
+      setIsUpdatingPassword(false)
+    }
+  }
+
+  const handleJoinMentorProject = async (event) => {
+    event.preventDefault()
+    if (!mentorProjectCode.trim() || isJoiningMentorProject) return
+
+    setIsJoiningMentorProject(true)
+    setMentorCodeMessage('')
+    try {
+      const projectId = await joinProjectAsMentor(mentorProjectCode)
+      const workspace = await loadWorkspace(supabaseUser)
+      setProfile(workspace.profile)
+      setProjectsList(workspace.projects)
+      setTasks(workspace.tasks)
+      setInvitations(workspace.invitations || [])
+      setMentorProjectCode('')
+      setMentorCodeMessage('Project added to your mentor dashboard.')
+      const project = workspace.projects.find((item) => item.id === projectId)
+      if (project) setSelectedProject(project)
+    } catch (error) {
+      console.error('Unable to join project as mentor:', error)
+      setMentorCodeMessage(error.message?.includes('create_project_mentor_code')
+        || error.message?.includes('join_project_as_mentor')
+        ? 'Project sharing is not set up yet. Run supabase_project_mentors.sql in the Supabase SQL Editor.'
+        : error.message?.includes('Invalid project code')
+          ? 'That project code is invalid. Check the code with the student.'
+          : error.message || 'Unable to open this project.')
+    } finally {
+      setIsJoiningMentorProject(false)
+    }
+  }
+
+  const refreshMentorProject = async () => {
+    const workspace = await loadWorkspace(supabaseUser)
+    setProfile(workspace.profile)
+    setProjectsList(workspace.projects)
+    setTasks(workspace.tasks)
+    setInvitations(workspace.invitations || [])
+    setSelectedProject((current) => current
+      ? workspace.projects.find((project) => project.id === current.id) || current
+      : current)
   }
 
   const handleLogout = async () => {
@@ -592,6 +882,50 @@ function App() {
     setSelectedProject(null)
     setSelectedTask(null)
     setShowOnboarding(false)
+  }
+
+  const handleDeleteAccount = async () => {
+    if (deleteAccountConfirmation !== 'DELETE' || isDeletingAccount) return
+
+    setIsDeletingAccount(true)
+    setDeleteAccountError('')
+    try {
+      const { error } = await supabase.functions.invoke('delete-account', {
+        method: 'POST',
+      })
+      if (error) throw error
+
+      const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' })
+      if (signOutError) console.error('Unable to clear the deleted account session:', signOutError)
+
+      setShowDeleteAccountDialog(false)
+      setDeleteAccountConfirmation('')
+      setSupabaseUser(null)
+      setProfile(null)
+      setProjectsList([])
+      setTasks([])
+      setMeetingsList([])
+      setInvitations([])
+      setSelectedProject(null)
+      setSelectedTask(null)
+      setShowOnboarding(false)
+      setAuthMessage('Your account has been permanently deleted.')
+      setActiveNav('Home')
+    } catch (error) {
+      console.error('Account deletion failed:', error)
+      let responseMessage
+      if (error?.context instanceof Response) {
+        const responseBody = await error.context.clone().json().catch(() => null)
+        responseMessage = responseBody?.error
+      }
+      setDeleteAccountError(
+        responseMessage
+        || error.message
+        || 'Unable to delete your account. Try again or contact support.',
+      )
+    } finally {
+      setIsDeletingAccount(false)
+    }
   }
 
   const handleManualTestActivity = async () => {
@@ -675,9 +1009,13 @@ function App() {
 
   useEffect(() => {
     let isMounted = true
+    let activeWorkspaceRequest = 0
+    const recoveryRequested = new URLSearchParams(window.location.hash.slice(1)).get('type') === 'recovery'
+      || new URLSearchParams(window.location.search).get('type') === 'recovery'
 
     const loadUserWorkspace = async (session) => {
       if (!isMounted) return
+      const requestId = ++activeWorkspaceRequest
       const user = session?.user ?? null
       setSupabaseUser(user)
       if (!user) {
@@ -695,7 +1033,7 @@ function App() {
       setIsCheckingOnboarding(true)
       try {
         const workspace = await loadWorkspace(user)
-        if (!isMounted) return
+        if (!isMounted || requestId !== activeWorkspaceRequest) return
         setProfile(workspace.profile)
         setProjectsList(workspace.projects)
         setTasks(workspace.tasks)
@@ -704,6 +1042,7 @@ function App() {
         // Check if user has completed onboarding (with error handling)
         try {
           const onboardingCompleted = await checkOnboardingCompleted(user.id)
+          if (!isMounted || requestId !== activeWorkspaceRequest) return
           if (!onboardingCompleted) {
             setShowOnboarding(true)
           }
@@ -713,7 +1052,7 @@ function App() {
           setShowOnboarding(false)
         }
       } catch (error) {
-        if (isMounted) {
+        if (isMounted && requestId === activeWorkspaceRequest) {
           console.error('Workspace load error:', error)
           setProfile(null)
           setProjectsList([])
@@ -723,16 +1062,41 @@ function App() {
           showSupabaseError(error, 'Unable to load your workspace.')
         }
       } finally {
-        if (isMounted) {
+        if (isMounted && requestId === activeWorkspaceRequest) {
           setIsWorkspaceLoading(false)
           setIsCheckingOnboarding(false)
         }
       }
     }
 
-    supabase.auth.getSession().then(({ data: { session } }) => loadUserWorkspace(session))
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsPasswordRecovery(true)
+        setPasswordRecoveryMessage('')
+      }
       window.setTimeout(() => loadUserWorkspace(session), 0)
+    })
+
+    if (recoveryRequested) {
+      setIsPasswordRecovery(true)
+    }
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (error) throw error
+      if (isMounted && recoveryRequested && !data.session) {
+        setPasswordRecoveryMessage('This reset link has expired or could not be verified. Request a new password reset link.')
+      }
+      return loadUserWorkspace(data.session)
+    }).catch((error) => {
+      if (isMounted) {
+        console.error('Unable to restore the authentication session:', error)
+        if (recoveryRequested) {
+          setIsPasswordRecovery(true)
+          setPasswordRecoveryMessage(error.message || 'This password reset link is invalid or expired. Request a new reset link.')
+        } else {
+          showSupabaseError(error, 'Unable to restore your login session.')
+        }
+      }
     })
 
     return () => {
@@ -757,6 +1121,26 @@ function App() {
     }
     loadProjectInvitations()
   }, [selectedProject])
+
+  useEffect(() => {
+    if (!supabaseUser || !projectsList.length) {
+      setMeetingsList([])
+      return undefined
+    }
+
+    let isMounted = true
+    listProjectMeetings(projectsList.map((project) => project.id))
+      .then((meetings) => isMounted && setMeetingsList(meetings))
+      .catch((error) => {
+        console.error('Unable to load project meetings:', error)
+        if (isMounted) {
+          setMeetingsList([])
+          showSupabaseError(error, 'Unable to load meetings. Run supabase_project_meetings.sql in Supabase.')
+        }
+      })
+
+    return () => { isMounted = false }
+  }, [projectsList, supabaseUser])
 
   useEffect(() => {
     if (!supabaseUser || !projectsList.length) {
@@ -889,6 +1273,66 @@ function App() {
     e.preventDefault()
     if (!newProjectName.trim()) return
 
+    if (isPasswordRecovery) {
+      return (
+        <div className="app-shell">
+          <main className="main-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+            <div style={{ maxWidth: '400px', width: '100%', padding: '20px' }}>
+              <div className="section-kicker" style={{ textAlign: 'center', marginBottom: '10px' }}>GROUPIFY</div>
+              <h2 style={{ textAlign: 'center', marginBottom: '12px', fontSize: '28px' }}>Choose a new password</h2>
+              <p style={{ textAlign: 'center', color: '#71819a', fontSize: '13px', margin: '0 0 22px' }}>Enter and confirm your new password. After it is changed, Groupify will sign you in.</p>
+              <form onSubmit={handlePasswordUpdate} style={{ display: 'grid', gap: '15px' }}>
+                <input
+                  type="password"
+                  placeholder="New password"
+                  aria-label="New password"
+                  autoComplete="new-password"
+                  minLength={6}
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  required
+                  style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
+                />
+                <input
+                  type="password"
+                  placeholder="Confirm new password"
+                  aria-label="Confirm new password"
+                  autoComplete="new-password"
+                  minLength={6}
+                  value={confirmNewPassword}
+                  onChange={(event) => setConfirmNewPassword(event.target.value)}
+                  required
+                  style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
+                />
+                {passwordRecoveryMessage && <p role="alert" style={{ color: '#ffb8bd', fontSize: '12px', margin: 0 }}>{passwordRecoveryMessage}</p>}
+                <button type="submit" className="primary-button" disabled={isUpdatingPassword}>
+                  {isUpdatingPassword ? 'Updating...' : 'Update password'}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={async () => {
+                    const { error } = await supabase.auth.signOut()
+                    if (error) {
+                      setPasswordRecoveryMessage(error.message || 'Unable to return to sign in.')
+                      return
+                    }
+                    setIsPasswordRecovery(false)
+                    setPasswordRecoveryMessage('')
+                    setNewPassword('')
+                    setConfirmNewPassword('')
+                  }}
+                  disabled={isUpdatingPassword}
+                >
+                  Back to sign in
+                </button>
+              </form>
+            </div>
+          </main>
+        </div>
+      )
+    }
+
     if (!supabaseUser) {
       showSupabaseError(null, 'Please log in again to create a project.')
       return
@@ -971,21 +1415,31 @@ function App() {
     }
   }
 
-  // Schedule Meeting (Shared with Everyone)
-  const handleScheduleMeeting = (e) => {
+  // Schedule a project meeting visible to its members.
+  const handleScheduleMeeting = async (e) => {
     e.preventDefault()
     if (!newMeetingTitle.trim() || !newMeetingLink.trim()) return
 
-    const targetProjectName = newMeetingProject || selectedProject?.name || projectsList[0]?.name || 'Smart Agriculture'
-    let dayLabel = 'Today'
-    if (newMeetingDateOption === 'Tomorrow') {
-      dayLabel = 'Tomorrow'
-    } else if (newMeetingDateOption === 'Custom') {
-      dayLabel = formatDateDisplay(newMeetingCustomDate)
+    const targetProject = projectsList.find((project) => project.name === newMeetingProject)
+      || selectedProject
+      || projectsList[0]
+    if (!supabaseUser || !targetProject) {
+      showSupabaseError(null, 'Select a project before scheduling a meeting.')
+      return
     }
 
-    const formattedTime = formatTimeDisplay(newMeetingTime)
-    const timeDisplay = `${dayLabel}, ${formattedTime} (${newMeetingDuration})`
+    const meetingDate = newMeetingDateOption === 'Custom'
+      ? newMeetingCustomDate
+      : (() => {
+          const date = new Date()
+          if (newMeetingDateOption === 'Tomorrow') date.setDate(date.getDate() + 1)
+          return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+        })()
+    const startsAt = new Date(`${meetingDate}T${newMeetingTime}`)
+    if (Number.isNaN(startsAt.getTime())) {
+      showSupabaseError(null, 'Enter a valid meeting date and time.')
+      return
+    }
 
     let formattedLink = newMeetingLink.trim()
     if (!formattedLink.startsWith('http://') && !formattedLink.startsWith('https://')) {
@@ -993,24 +1447,22 @@ function App() {
     }
 
     const platform = formattedLink.includes('zoom') ? 'Zoom' : formattedLink.includes('teams') ? 'MS Teams' : 'Google Meet'
-
-    const newMeeting = {
-      id: Date.now().toString(),
-      title: newMeetingTitle.trim(),
-      project: targetProjectName,
-      host: 'Shruti Mehta (Product Lead)',
-      hostAvatar: 'S',
-      time: timeDisplay,
-      dateLabel: dayLabel,
-      link: formattedLink,
-      platform: platform,
-      status: 'Upcoming'
+    try {
+      await createProjectMeeting(supabaseUser.id, targetProject.id, {
+        title: newMeetingTitle.trim(),
+        link: formattedLink,
+        startsAt: startsAt.toISOString(),
+        duration: newMeetingDuration,
+        platform,
+      })
+      const updatedMeetings = await listProjectMeetings(projectsList.map((project) => project.id))
+      setMeetingsList(updatedMeetings)
+      setNewMeetingTitle('')
+      setShowNewMeetingModal(false)
+      setActiveNav('Meetings')
+    } catch (error) {
+      showSupabaseError(error, 'Unable to schedule the meeting. Run supabase_project_meetings.sql and make sure you are a member of the selected project.')
     }
-
-    setMeetingsList([newMeeting, ...meetingsList])
-    setNewMeetingTitle('')
-    setShowNewMeetingModal(false)
-    setActiveNav('Meetings')
   }
 
   // Add Team Member to Project
@@ -1232,13 +1684,30 @@ function App() {
         <main className="main-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
           <div style={{ maxWidth: '400px', width: '100%', padding: '20px' }}>
             <div className="section-kicker" style={{ textAlign: 'center', marginBottom: '10px' }}>GROUPIFY</div>
-            <h2 style={{ textAlign: 'center', marginBottom: '30px', fontSize: '32px' }}>Collaborate on projects</h2>
+            <h2 style={{ textAlign: 'center', marginBottom: '12px', fontSize: '32px' }}>Collaborate on projects</h2>
+            <p style={{ textAlign: 'center', color: '#71819a', fontSize: '13px', margin: '0 0 22px' }}>{authMode === 'login' ? 'Choose how you want to sign in.' : 'Choose the type of account to create.'}</p>
             <form onSubmit={handleAuthSubmit} style={{ display: 'grid', gap: '15px' }}>
+              <div role="group" aria-label="Sign in as" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '4px' }}>
+                {['Student', 'Mentor'].map((role) => (
+                  <button
+                    key={role}
+                    type="button"
+                    className={authRole === role ? 'primary-button' : 'ghost-button'}
+                    aria-pressed={authRole === role}
+                    onClick={() => { setAuthRole(role); setAuthMessage('') }}
+                  >
+                    {authMode === 'login' ? `Login as ${role.toLowerCase()}` : `Sign up as ${role.toLowerCase()}`}
+                  </button>
+                ))}
+              </div>
               <input
                 type="email"
                 placeholder="Email"
                 value={authEmail}
-                onChange={(event) => setAuthEmail(event.target.value)}
+                onChange={(event) => {
+                  setAuthEmail(event.target.value)
+                  setCanResendConfirmation(false)
+                }}
                 autoFocus
                 style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
               />
@@ -1249,9 +1718,29 @@ function App() {
                 onChange={(event) => setAuthPassword(event.target.value)}
                 style={{ width: '100%', padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
               />
-              {authMessage && <p style={{ color: '#ffb8bd', fontSize: '12px', margin: 0 }}>{authMessage}</p>}
+              {authMode === 'login' && <button
+                type="button"
+                className="ghost-button"
+                onClick={handleForgotPassword}
+                disabled={authLoading}
+                style={{ justifySelf: 'end', padding: '4px 0', border: 0, background: 'transparent', color: '#55e0e6' }}
+              >
+                {authLoading ? 'Please wait...' : 'Forgot password?'}
+              </button>}
+              {authMessage && <p role="status" style={{ color: authMessage.startsWith('If an account exists') || authMessage.startsWith('Account created.') || authMessage.startsWith('Confirmation email sent.') ? '#4cd39b' : '#ffb8bd', fontSize: '12px', margin: 0 }}>{authMessage}</p>}
+              {canResendConfirmation && (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={handleResendConfirmation}
+                  disabled={authLoading}
+                  style={{ justifySelf: 'start', padding: '4px 0', border: 0, background: 'transparent', color: '#55e0e6' }}
+                >
+                  {authLoading ? 'Please wait...' : 'Resend confirmation email'}
+                </button>
+              )}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
-                <button type="button" className="ghost-button" onClick={() => { setAuthMode(authMode === 'login' ? 'signup' : 'login'); setAuthMessage('') }}>
+                <button type="button" className="ghost-button" onClick={() => { setAuthMode(authMode === 'login' ? 'signup' : 'login'); setAuthMessage(''); setCanResendConfirmation(false) }}>
                   {authMode === 'login' ? 'Create account' : 'Back to sign in'}
                 </button>
                 <button type="submit" className="primary-button" disabled={authLoading}>
@@ -1270,7 +1759,7 @@ function App() {
     return (
       <div className="app-shell">
         <Onboarding 
-          user={supabaseUser} 
+          initialRole={profile?.role || supabaseUser.user_metadata?.account_role || 'Student'}
           onComplete={handleOnboardingComplete} 
         />
       </div>
@@ -1290,7 +1779,7 @@ function App() {
           <span className="chevron">⌄</span>
         </div>
         <nav className="main-nav">
-          {navItems.map(([icon, label]) => (
+          {visibleNavItems.map(([icon, label]) => (
             <button 
               className={activeNav === label ? 'nav-item active' : 'nav-item'} 
               key={label} 
@@ -1300,11 +1789,13 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="nav-label">WORKSPACE</div>
-        <button className={activeNav === 'Files' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Files')}><span>▣</span>Files</button>
-        <button className={activeNav === 'GitHub' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('GitHub')}><span>⌘</span>GitHub</button>
+        {!isMentor && <>
+          <div className="nav-label">WORKSPACE</div>
+          <button className={activeNav === 'Files' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Files')}><span>▣</span>Files</button>
+          <button className={activeNav === 'GitHub' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('GitHub')}><span>⌘</span>GitHub</button>
+        </>}
         <div className="sidebar-bottom">
-          <button className={activeNav === 'Settings' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Settings')}><span>⚙</span>Settings</button>
+          {!isMentor && <button className={activeNav === 'Settings' ? 'nav-item active' : 'nav-item'} onClick={() => setActiveNav('Settings')}><span>⚙</span>Settings</button>}
           <div className="profile-mini">
             <div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div>
             <span><strong>{profile?.name || getProfileName(supabaseUser)}</strong><small>{supabaseUser?.email || 'View profile'}</small></span>
@@ -1347,12 +1838,12 @@ function App() {
             <section className="projects-section" style={{ marginTop: '0', marginBottom: '40px' }}>
               <div className="panel-heading" style={{ marginBottom: '24px' }}>
                 <div>
-                  <div className="section-kicker">YOUR WORKSPACE</div>
-                  <h2 style={{ fontSize: '28px', margin: '4px 0 2px' }}>Projects <span className="count-pill">{projectsList.length}</span></h2>
-                  <p style={{ fontSize: '13px', color: '#687d98', margin: '0' }}>All active and completed team projects</p>
+                  <div className="section-kicker">{isMentor ? 'MENTOR WORKSPACE' : 'YOUR WORKSPACE'}</div>
+                  <h2 style={{ fontSize: '28px', margin: '4px 0 2px' }}>{isMentor ? 'Projects I mentor' : 'Projects'} <span className="count-pill">{projectsList.length}</span></h2>
+                  <p style={{ fontSize: '13px', color: '#687d98', margin: '0' }}>{isMentor ? 'Monitor student project progress using a share code.' : 'All active and completed team projects'}</p>
                 </div>
                 <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-                  <button className="primary-button" style={{ padding: '9px 16px', fontSize: '12px' }} onClick={() => setShowNewProjectModal(true)}>+ New Project</button>
+                  {!isMentor && <button className="primary-button" style={{ padding: '9px 16px', fontSize: '12px' }} onClick={() => setShowNewProjectModal(true)}>+ New Project</button>}
                   <div className="filter-row">
                     {['All', 'Active', 'Completed', 'At Risk'].map((item) => (
                       <button 
@@ -1366,6 +1857,24 @@ function App() {
                   </div>
                 </div>
               </div>
+
+              {isMentor && <form onSubmit={handleJoinMentorProject} className="panel" style={{ marginBottom: '24px', padding: '20px', background: '#0a1424' }}>
+                <div className="section-kicker">ADD A STUDENT PROJECT</div>
+                <div style={{ display: 'flex', gap: '10px', marginTop: '10px', flexWrap: 'wrap' }}>
+                  <input
+                    value={mentorProjectCode}
+                    onChange={(event) => setMentorProjectCode(event.target.value.toUpperCase())}
+                    placeholder="Enter project code"
+                    aria-label="Project share code"
+                    maxLength={12}
+                    style={{ flex: '1 1 220px', minWidth: 0, padding: '12px 14px', borderRadius: '9px', border: '1px solid #294365', background: '#091322', color: '#fff', fontSize: '14px', outline: 'none' }}
+                  />
+                  <button className="primary-button" type="submit" disabled={isJoiningMentorProject || !mentorProjectCode.trim()}>
+                    {isJoiningMentorProject ? 'Opening...' : 'Open project'}
+                  </button>
+                </div>
+                {mentorCodeMessage && <p role="status" style={{ color: mentorCodeMessage.startsWith('Project added') ? '#4cd39b' : '#ffb8bd', fontSize: '12px', margin: '10px 0 0' }}>{mentorCodeMessage}</p>}
+              </form>}
 
               <div className="project-grid">
                 {visibleProjects.length ? visibleProjects.map((project) => (
@@ -1555,7 +2064,7 @@ function App() {
           ) : activeNav === 'Settings' ? (
             <section className="panel workspace-page-panel">
               <div className="panel-heading"><div><div className="section-kicker">WORKSPACE PREFERENCES</div><h2>Settings</h2><p>Manage your Groupify account preferences.</p></div></div>
-              <div className="settings-list"><div className="settings-row"><span><strong>Account</strong><small>{profile?.name || getProfileName(supabaseUser, profile)} · {supabaseUser?.email}</small></span><div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div></div><label className="settings-row settings-toggle"><span><strong>Email notifications</strong><small>Receive updates about invitations and workspace activity.</small></span><input type="checkbox" checked={emailNotifications} onChange={(event) => setEmailNotifications(event.target.checked)} /></label><div className="settings-row"><span><strong>Session</strong><small>Sign out of this Groupify account.</small></span><button className="ghost-button" onClick={handleLogout}>Log out</button></div></div>
+              <div className="settings-list"><div className="settings-row"><span><strong>Account</strong><small>{profile?.name || getProfileName(supabaseUser, profile)} · {supabaseUser?.email}</small></span><div className="avatar avatar-purple">{profile?.initials || getInitials(getProfileName(supabaseUser, profile))}</div></div><label className="settings-row settings-toggle"><span><strong>Email notifications</strong><small>Receive updates about invitations and workspace activity.</small></span><input type="checkbox" checked={emailNotifications} onChange={(event) => setEmailNotifications(event.target.checked)} /></label><div className="settings-row"><span><strong>Session</strong><small>Sign out of this Groupify account.</small></span><button className="ghost-button" onClick={handleLogout}>Log out</button></div><div className="settings-row"><span><strong>Delete account</strong><small>Permanently delete your account and personal data. Projects you own will transfer to a teammate when possible; projects without another member will be deleted.</small></span><button className="ghost-button" style={{ color: '#ff8b96', borderColor: '#8b3d4b' }} onClick={() => { setDeleteAccountError(''); setDeleteAccountConfirmation(''); setShowDeleteAccountDialog(true) }}>Delete account</button></div></div>
             </section>
           ) : activeNav === 'Meetings' ? (
             /* DEDICATED MEETINGS PAGE - VISIBLE TO EVERYONE! */
@@ -1566,10 +2075,13 @@ function App() {
                   <h2 style={{ fontSize: '28px', margin: '4px 0 2px' }}>Team Meetings <span className="count-pill">{meetingsList.length}</span></h2>
                   <p style={{ fontSize: '13px', color: '#687d98', margin: '0' }}>Shared meeting links visible to all workspace team members</p>
                 </div>
-                <button 
+                <button
                   className="primary-button" 
                   style={{ padding: '9px 16px', fontSize: '12px' }}
-                  onClick={() => setShowNewMeetingModal(true)}
+                  onClick={() => {
+                    setNewMeetingProject(projectsList[0]?.name || '')
+                    setShowNewMeetingModal(true)
+                  }}
                 >
                   + Schedule Meeting
                 </button>
@@ -1904,17 +2416,17 @@ function App() {
       <button className="ai-fab" onClick={() => setShowAi(true)}><span>✦</span><i></i></button>
 
       <nav className="mobile-nav">
-        {navItems.slice(0, 4).map(([icon, label]) => (
+        {visibleNavItems.slice(0, 4).map(([icon, label]) => (
           <button className={activeNav === label ? 'active' : ''} key={label} onClick={() => setActiveNav(label)}>
             <span>{icon}</span>{label}
           </button>
         ))}
-        <button onClick={() => setShowQuickAdd(true)}><span className="mobile-add">+</span>Create</button>
+        {!isMentor && <button onClick={() => setShowQuickAdd(true)}><span className="mobile-add">+</span>Create</button>}
       </nav>
 
       {/* SCHEDULE MEETING MODAL */}
       {showNewMeetingModal && (
-        <div className="modal-backdrop" onClick={() => setShowNewMeetingModal(false)}>
+        <div className="modal-backdrop" style={{ zIndex: 10 }} onClick={() => setShowNewMeetingModal(false)}>
           <div className="quick-sheet" onClick={(event) => event.stopPropagation()}>
             <div className="sheet-handle"></div>
             <div className="section-kicker">SCHEDULE MEETING</div>
@@ -2168,6 +2680,8 @@ function App() {
           tasks={tasks}
           meetings={meetingsList}
           currentUser={{ id: supabaseUser.id, name: profile?.name || getProfileName(supabaseUser), avatar: profile?.initials || 'U', color: 'purple' }}
+          readOnly={isMentor}
+          onRefresh={refreshMentorProject}
           onClose={() => setSelectedProject(null)}
           onCreateTask={() => {
             setIsWorkspaceTaskModal(true)
@@ -2175,7 +2689,10 @@ function App() {
             setNewTaskAssignee(selectedProject.members[0]?.name || '')
             setShowNewTaskModal(true)
           }}
-          onScheduleMeeting={() => setShowNewMeetingModal(true)}
+          onScheduleMeeting={() => {
+            setNewMeetingProject(selectedProject.name)
+            setShowNewMeetingModal(true)
+          }}
           onAddMember={() => setShowAddMemberModal(true)}
           onToggleTask={toggleTask}
           onUpdateTask={updateTask}
@@ -2203,7 +2720,7 @@ function App() {
               <button className="close-button" onClick={() => setSelectedTask(null)}>×</button>
             </div>
 
-            <div style={{ margin: '14px 0', display: 'flex', gap: '10px', alignItems: 'center' }}>
+            {!isMentor && <div style={{ margin: '14px 0', display: 'flex', gap: '10px', alignItems: 'center' }}>
               <button 
                 className="primary-button" 
                 style={{ background: selectedTask.done ? '#287e85' : '#438cf4', padding: '8px 14px', fontSize: '11px' }}
@@ -2212,7 +2729,7 @@ function App() {
               >
                 {selectedTask.done ? '✓ Completed (Click to Reopen)' : 'Mark as Complete'}
               </button>
-            </div>
+            </div>}
 
             {/* COMMENTS / REVIEWS FEED */}
             <div style={{ marginTop: '20px' }}>
@@ -2241,7 +2758,7 @@ function App() {
                 )}
               </div>
 
-              <form onSubmit={handlePostComment} className="comment-input-row">
+              {!isMentor && <form onSubmit={handlePostComment} className="comment-input-row">
                 <input 
                   type="text" 
                   placeholder={`Write a review for ${selectedTask.assignee}...`} 
@@ -2249,7 +2766,7 @@ function App() {
                   onChange={(e) => setNewCommentText(e.target.value)}
                 />
                 <button type="submit" className="primary-button" style={{ padding: '10px 16px', fontSize: '11px' }}>Post Review</button>
-              </form>
+              </form>}
             </div>
           </div>
         </div>
@@ -2588,6 +3105,70 @@ function App() {
                 disabled={!githubUrl.trim()}
               >
                 Save Repository
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDeleteAccountDialog && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            if (!isDeletingAccount) setShowDeleteAccountDialog(false)
+          }}
+        >
+          <div
+            className="modal-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-account-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <h3 id="delete-account-title">Delete your account?</h3>
+              <button
+                className="modal-close"
+                aria-label="Close dialog"
+                disabled={isDeletingAccount}
+                onClick={() => setShowDeleteAccountDialog(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ color: '#b8c5d8', fontSize: '13px', lineHeight: 1.6 }}>
+                This permanently deletes your account and personal data. Projects you own will transfer to a teammate when possible; projects without another member will be deleted. This cannot be undone.
+              </p>
+              <label htmlFor="delete-account-confirmation">Type DELETE to confirm</label>
+              <input
+                id="delete-account-confirmation"
+                value={deleteAccountConfirmation}
+                onChange={(event) => setDeleteAccountConfirmation(event.target.value)}
+                autoComplete="off"
+                disabled={isDeletingAccount}
+                className="onboarding-input"
+              />
+              {deleteAccountError && <p role="alert" style={{ color: '#ff8b96', fontSize: '12px' }}>{deleteAccountError}</p>}
+              <p style={{ color: '#71849e', fontSize: '11px' }}>
+                Account deletion needs the <code>delete-account</code> Supabase Edge Function to be deployed.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="ghost-button"
+                disabled={isDeletingAccount}
+                onClick={() => setShowDeleteAccountDialog(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                style={{ background: '#8b3d4b' }}
+                disabled={isDeletingAccount || deleteAccountConfirmation !== 'DELETE'}
+                onClick={handleDeleteAccount}
+              >
+                {isDeletingAccount ? 'Deleting account...' : 'Permanently delete account'}
               </button>
             </div>
           </div>

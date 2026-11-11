@@ -1,0 +1,4 @@
+project_id = "groupify"
+
+[functions.delete-account]
+verify_jwt = true

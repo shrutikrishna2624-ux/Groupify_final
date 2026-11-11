@@ -27,18 +27,25 @@ const onboardingQuestions = [
   },
 ]
 
-function Onboarding({ onComplete, user }) {
+function Onboarding({ onComplete, initialRole = 'Student' }) {
+  const isMentor = initialRole === 'Mentor' || initialRole === 'Faculty/Mentor'
+  const roleAnswer = isMentor
+    ? 'Faculty/Mentor'
+    : initialRole
+  const questions = isMentor
+    ? onboardingQuestions.filter(({ id }) => !['year', 'focusArea'].includes(id))
+    : onboardingQuestions
   const [currentStep, setCurrentStep] = useState(0)
   const [answers, setAnswers] = useState({
     displayName: '',
-    role: 'Student',
+    role: roleAnswer,
     year: 'First Year',
     focusArea: 'Web Development',
   })
   const [isSubmitting, setIsSubmitting] = useState(false)
 
-  const currentQuestion = onboardingQuestions[currentStep]
-  const isLastStep = currentStep === onboardingQuestions.length - 1
+  const currentQuestion = questions[currentStep]
+  const isLastStep = currentStep === questions.length - 1
 
   const handleAnswerChange = (value) => {
     setAnswers((prev) => ({ ...prev, [currentQuestion.id]: value }))
@@ -82,11 +89,11 @@ function Onboarding({ onComplete, user }) {
             <span>groupify<span className="brand-dot">.</span></span>
           </div>
           <div className="onboarding-progress">
-            <span className="progress-text">{currentStep + 1} of {onboardingQuestions.length}</span>
+            <span className="progress-text">{currentStep + 1} of {questions.length}</span>
             <div className="progress-bar">
               <div 
                 className="progress-fill" 
-                style={{ width: `${((currentStep + 1) / onboardingQuestions.length) * 100}%` }}
+                style={{ width: `${((currentStep + 1) / questions.length) * 100}%` }}
               />
             </div>
           </div>
@@ -107,7 +114,12 @@ function Onboarding({ onComplete, user }) {
             />
           ) : (
             <div className="onboarding-options">
-              {currentQuestion.options.map((option) => (
+              {(currentQuestion.id === 'role'
+                ? roleAnswer === 'Faculty/Mentor'
+                  ? ['Faculty/Mentor']
+                  : ['Student', 'Team Lead', 'Other']
+                : currentQuestion.options
+              ).map((option) => (
                 <button
                   key={option}
                   className={`onboarding-option ${answers[currentQuestion.id] === option ? 'selected' : ''}`}
